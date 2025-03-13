@@ -1,0 +1,764 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+library(Seurat)
+library(SCINA)
+library(tidyverse)
+library(rstatix)
+
+options(stringsAsFactors = F)
+
+theme_set(theme_classic(base_size = 14)) 
+theme_update(plot.background = element_blank(), 
+             panel.background = element_blank(), 
+             legend.background = element_blank(), 
+             legend.key = element_blank())
+
+```
+
+Loading Data
+============
+
+Working with the output from cellranger aggr - took the per sample outputs from cellranger multi and aggregated them into a single matrix. The first sample listed in the aggr csv file was Ctrl, and the second was dKO - so barcodes assigned to Ctrl will end in _1 and to dKO with _2. 
+
+We're working with the filtered h5 file, which means that we have to also install the hdf5r package in R.  This means we can load the data from a single file using the ```Read10x_h5``` function in Seurat.
+
+h5 file is available on GEO: GSE240517
+
+```{r}
+
+Read10X_h5("outs/count/filtered_feature_bc_matrix.h5") -> Treg_data_all
+
+```
+
+Since we have multiplexing and antibody capture in there as well, this gives us a list of matrices. 
+
+First create a seurat object using the Gene Expression matrix.
+
+```{r}
+
+CreateSeuratObject(
+  counts=Treg_data_all$`Gene Expression`, 
+  project="Treg", 
+  min.cells = 3, 
+  min.features=200
+) -> Treg_data
+
+Treg_data
+```
+
+This is stored as the "RNA" assay
+
+We can also add the multiplexing and antibody capture as separate assays.
+
+But since we required min.features = 200 above, first need to filter these to only include barcodes that are in Treg_data.
+
+```{r}
+t(matrix(Treg_data_all$`Antibody Capture`[names(Treg_data_all$`Antibody Capture`) %in% colnames(Treg_data)],dimnames = list(names(Treg_data_all$`Antibody Capture`)[names(Treg_data_all$`Antibody Capture`) %in% colnames(Treg_data)], "IL7RA"))) -> antibody_counts_filtered
+
+CreateAssayObject(counts = antibody_counts_filtered) -> Treg_data[["ADT"]]
+
+CreateAssayObject(counts = Treg_data_all$`Multiplexing Capture`[,colnames(Treg_data_all$`Multiplexing Capture`) %in% colnames(Treg_data)]) -> Treg_data[["MPC"]]
+
+Treg_data
+```
+
+We also want to add in the genotype as metadata. This is based on the cell multiplexing hashtag oligos - it's added as an assay object (although not sure that's strictly necessary), but the easiest way to identify them is to use the _1 or _2 on the ends of the barcode names. 
+
+
+```{r}
+Treg_data$Genotype <- if_else(grepl("-1$", colnames(Treg_data)), "Ctrl", "dKO")
+
+Treg_data@meta.data
+summary(as.factor(Treg_data$Genotype))
+```
+
+For now we will also set the Identity of the cells to be their genotype, so eg for QC we can plot these separately
+
+```{r}
+Idents(Treg_data) <- Treg_data$Genotype
+```
+
+
+QC and filtering
+=================
+
+In addition to ```nCount_RNA``` (total number of reads in the dataset) and ```nFeature_RNA``` (number of observed genes), there are a couple of other metrics we can filter on.
+
+
+Amount of MT genes
+------------------
+
+We can calculate the percentage of the data coming from a set of genes using the ```PercentageFeatureSet``` function.  We can store the result in the main metadata store for the object by defining a new column called "percent.MT".
+
+```{r}
+PercentageFeatureSet(Treg_data,pattern="^mt-") -> Treg_data$percent.MT
+
+head(Treg_data$percent.MT)
+```
+
+Percentage of Largest Gene
+--------------------------
+
+
+```{r}
+
+apply(
+  Treg_data@assays$RNA@counts, # more recent Seurat is @layers$counts
+  2,
+  function(x)(100*max(x))/sum(x)
+) -> Treg_data$Percent.Largest.Gene
+
+head(Treg_data$Percent.Largest.Gene)
+
+```
+
+
+
+Plotting QC Metrics
+-------------------
+
+
+```{r fig.width=12, fig.height=8}
+VlnPlot(Treg_data, features=c("nCount_RNA","percent.MT"))
+```
+
+Log transformed:
+
+```{r fig.width=12, fig.height=8}
+VlnPlot(Treg_data, features=c("nCount_RNA")) + scale_y_log10() 
+VlnPlot(Treg_data, features=c("percent.MT")) + scale_y_log10()
+
+
+
+
+VlnPlot(Treg_data, features=c("nFeature_RNA")) + scale_y_log10()+
+  geom_hline(yintercept = 1000) +
+  geom_hline(yintercept = 4200)
+
+
+
+```
+
+
+
+
+```{r}
+FeatureScatter(Treg_data,feature1 = "nCount_RNA", feature2 = "Percent.Largest.Gene")
+
+
+```
+
+
+```{r}
+
+
+as_tibble(
+  Treg_data[[c("nCount_RNA","nFeature_RNA","percent.MT","Percent.Largest.Gene")]],
+  rownames="Cell.Barcode"
+) -> qc.metrics
+
+qc.metrics
+
+```
+
+
+```{r fig.height=7, fig.width=9}
+qc.metrics %>%
+  arrange(percent.MT) %>%
+  ggplot(aes(nCount_RNA,nFeature_RNA,colour=percent.MT)) + 
+  geom_point() + 
+  scale_color_gradientn(colors=c("black","blue","green2","red","yellow")) +
+  geom_hline(yintercept = 1000) +
+  geom_hline(yintercept = 4200) 
+
+
+```
+
+
+```{r}
+qc.metrics %>%
+  ggplot(aes(percent.MT)) + 
+  geom_histogram(binwidth = 0.5, fill="yellow", colour="black") +
+  ggtitle("Distribution of Percentage Mitochondrion") +
+  geom_vline(xintercept = 5.5)
+
+#ggsave("Percent_mito.pdf")
+```
+
+```{r}
+qc.metrics %>%
+  ggplot(aes(Percent.Largest.Gene)) + 
+  geom_histogram(binwidth = 0.7, fill="yellow", colour="black") +
+  ggtitle("Distribution of Percentage Largest Gene") +
+  geom_vline(xintercept = 10)
+```
+```{r}
+
+
+VlnPlot(Treg_data, features=c("nCount_MPC")) + scale_y_log10() + geom_hline(yintercept = 14000)+ geom_hline(yintercept = 1500)
+
+```
+
+Filtering
+=========
+
+From the QC we can then filter the data to get rid of cells with unusual QC metrics.  We would like to examine all of the metrics we've come up with and set appropriate filters.
+
+
+```{r}
+subset(
+  Treg_data,
+    nFeature_RNA> 1000 & 
+    nFeature_RNA < 4200 & 
+    percent.MT < 5.5 & 
+    Percent.Largest.Gene < 10 &
+    nCount_MPC < 14000 &
+    nCount_MPC > 1500
+  ) -> Treg_data_filtered
+
+Treg_data_filtered
+
+
+#saveRDS(Treg_data_filtered, file= "Treg_data_filtered_before_norm.RDS")
+
+
+dim(Treg_data_filtered)
+dim(Treg_data) # 17.188 cells before filtering, after filtering # 9987
+
+
+
+
+```
+
+
+Normalisation, Selection and Scaling
+====================================
+
+
+Normalisation
+-------------
+
+
+Normalise using a centered log ratio transformation - more similar to the sort of size factor based normalisation which is used for many RNA-Seq experiments, compared with the default "LogNormalize" method.
+
+
+```{r}
+NormalizeData(Treg_data_filtered, normalization.method = "CLR", margin = 2) -> Treg_data_filtered
+
+
+```
+
+
+Gene Selection
+--------------
+
+Before going on to do the dimensionality reduction we're going to do some filtering of genes to remove those which are likely to be uninformative in the overall structure of the data.  The main method to do this is to find unusually variable genes - these are calculated in the context of the gene's expression since lowly expressed genes are more likely to be variable by standard measures.
+
+Seurat provides a method to calculate a normalised intensity for each gene, and can then select the top 'n' most variable features.  In this case we're selecting the 500 most variable genes.
+
+```{r}
+FindVariableFeatures(
+  Treg_data_filtered, 
+  selection.method = "vst", 
+  nfeatures=500
+) -> Treg_data_filtered
+
+
+
+```
+
+The variability information can be accessed using the HVFInfo method.  The names of the variable features can be accessed with ```VariableFeatures()```.
+
+```{r}
+as_tibble(HVFInfo(Treg_data_filtered),rownames = "Gene") -> variance.data
+
+variance.data %>% 
+  mutate(hypervariable=Gene %in% VariableFeatures(Treg_data_filtered)
+) -> variance.data
+
+head(variance.data, n=10)
+variance.data %>% arrange(desc(hypervariable))
+```
+
+
+
+```{r}
+variance.data %>% 
+  ggplot(aes(log(mean),log(variance),color=hypervariable)) + 
+  geom_point() + 
+  scale_color_manual(values=c("black","red"))
+```
+
+Scaling
+-------
+
+Before putting the data into PCA for dimensionality reduction we will scale the genes so that they have a mean of 0 and a variance of 1.  -> less biased by expression level in the PCA.
+
+```{r}
+ScaleData(Treg_data_filtered,features=rownames(Treg_data_filtered)) -> Treg_data_filtered
+```
+
+Dimensionality Reduction
+========================
+
+We're going to use two methods - PCA and UMAP.
+
+PCA
+---
+
+Run PCA using the variable features which we previously selected.  The PCA will calculate all of our PCs and will also give us a list of the genes which were most highly (and lowly) weighted in the different PCs.
+
+```{r}
+RunPCA(Treg_data_filtered,features=VariableFeatures(Treg_data_filtered)) -> Treg_data_filtered
+```
+
+
+
+```{r fig.height=6, fig.width=8}
+DimPlot(Treg_data_filtered,reduction="pca")
+```
+
+
+
+```{r fig.height=6, fig.width=8}
+DimPlot(Treg_data_filtered,reduction="pca", dims=c(3,4))
+```
+
+
+
+```{r fig.height=4, fig.width=8}
+ElbowPlot(Treg_data_filtered)
+```
+
+
+```{r fig.height=15,fig.width=8}
+DimHeatmap(Treg_data_filtered,dims=1:15, cells=500)
+```
+
+Using up to PC15 there is still some visible structure
+
+
+UMAP
+-----
+
+```{r fig.height=5, fig.width=8}
+RunUMAP(Treg_data_filtered, dims = 1:15, n.neighbors = 15) -> Treg_data_filtered
+
+
+DimPlot(Treg_data_filtered,reduction="umap",pt.size = 1, label = TRUE, label.size = 7, split.by = "Genotype") +
+  theme(legend.position = "none")
+
+```
+
+Defining Cell Clusters
+======================
+
+FindNeighbours uses a graph based method to detect clusters.  This finds the 'k' (default 20) nearest neighbours to each cell and makes this into a graph.  It then looks for highly inter-connected subgraphs within the graph and uses these to define clusters.  
+
+Use the first 15 dimensions of the PCA to calculate the neighbours.
+
+
+```{r}
+FindNeighbors(Treg_data_filtered,dims=1:15) -> Treg_data_filtered
+```
+```{r}
+Treg_data_filtered@graphs$RNA_snn[1:20,1:20]
+```
+We can then segment the graph using the ```FindClusters``` method.  The resolution controls how fragmented the graph will be.  Larger values give larger clusters, smaller values gives smaller clusters.
+
+```{r}
+FindClusters(Treg_data_filtered,resolution = 0.5) -> Treg_data_filtered
+```
+
+The clusters are stored in the "seurat_clusters" metadata annotation so they can be used in any way the previous QC data was used. 
+
+```{r}
+head(Treg_data_filtered$seurat_clusters, n=50)
+```
+
+Examining the properties of the clusters
+========================================
+
+Now that we have our clusters we can look to see if they are being influenced by any of the QC metrics we calculated earlier.  We can see that some of the clusters are skewed in one or more of the metrics we've calculated so we will want to take note of this.  Some of these skews could be biological in nature, but they could be noise coming from the data.
+
+
+Number of reads
+---------------
+```{r}
+VlnPlot(Treg_data_filtered,features="nCount_RNA")
+
+
+#ggsave("nCount_RNA_lesscon.pdf")
+
+```
+
+Figure S18c - Number of genes detected in each cluster
+--------------------------------------------------------
+
+```{r}
+VlnPlot(Treg_data_filtered,features="nFeature_RNA")
+
+#ggsave("nFeatureRNA.pdf")
+
+
+```
+It might be tempting to think that clusters 8, 10 and 12 could be from GEMs where two or more cells were captured since they all have unusually high coverage and diversity.  They are also small and tightly clustered away from the main groups of points.
+
+
+Percent Largest Gene
+--------------------
+```{r}
+VlnPlot(Treg_data_filtered,features="Percent.Largest.Gene")
+
+#ggsave("Percent_largest_gene.pdf")
+
+
+```
+
+Percent Mitochondrion
+---------------------
+```{r}
+VlnPlot(Treg_data_filtered,features="percent.MT")
+
+
+#ggsave("Percent_MT.pdf")
+
+
+
+```
+
+KI-67
+------
+```{r}
+VlnPlot(Treg_data_filtered,features="Mki67")
+
+
+#ggsave("Mki67.pdf")
+
+```
+
+Figure 7a - Clusters on UMAP
+-------------------------------
+
+```{r fig.height=5, fig.width=4.5}
+DimPlot(Treg_data_filtered,reduction="umap",pt.size = 2, label = TRUE, label.size = 8) +
+  theme(legend.position = "none")
+#ggsave("UMAP_clusters_overall.pdf")
+```
+
+
+Figure 7d - clusters by genotype
+----------------------------------
+
+
+```{r}
+
+Treg_data_filtered@meta.data %>%
+  group_by(seurat_clusters,Genotype) %>%
+  count() %>%
+  group_by(seurat_clusters) %>%
+  mutate(percent=100*n/sum(n)) %>%
+  ungroup() %>%
+  ggplot(aes(x=seurat_clusters, y=percent, fill= Genotype)) +
+  geom_col(colour = "black") +
+  scale_fill_manual(values = c("black","white")) +
+  scale_y_continuous(expand = expansion(mult = c(0,0.05)))
+
+
+#ggsave("Percentage_cells_clusters.pdf")
+  
+```
+
+```{r fig.height=5, fig.width=7}
+DimPlot(Treg_data_filtered,reduction="umap",pt.size = 2, label = TRUE, label.size = 8, split.by = "Genotype") +
+  theme(legend.position = "none")
+#ggsave("UMAP_clusters_by_genotype.pdf")
+
+```
+
+Designation of naive vs activated cells
+=========================================
+
+We are using scina to define cell identities.  This analysis requires a list of marker genes for each of the cell types we want to find - our marker genes come from bulk RNAseq DE analysis of naive vs effector Treg (floxed controls).
+
+(see supplementary tables accompanying manuscript for gene lists)
+
+```{r}
+as.data.frame(Treg_data_filtered@assays$RNA[,]) -> scina.data
+
+preprocess.signatures("nTreg_eTreg_genes.csv") -> Naive_Effector
+
+length(intersect(Naive_Effector$Treg.naive, Naive_Effector$Treg.effector))
+
+```
+```{r}
+
+FindVariableFeatures(
+  Treg_data_filtered, 
+  selection.method = "vst", 
+  nfeatures=1000
+) -> Treg_data_filtered_to1000
+
+
+```
+```{r}
+as_tibble(HVFInfo(Treg_data_filtered_to1000),rownames = "Gene") -> variance.data.to1000
+
+variance.data.to1000 %>% 
+  mutate(Variable=Gene %in% VariableFeatures(Treg_data_filtered_to1000)
+) -> variance.data.to1000
+
+
+variance.data.to1000 %>% arrange(desc(Variable))
+
+variance.data.to1000$Variable -> Variable
+
+cbind (variance.data, Variable)
+```
+
+```{r}
+
+
+variance.data %>%
+  filter(Variable == TRUE)%>%
+  pull(Gene) -> Variable_genes
+
+Naive_Effector -> Naive_Effector_filtered
+
+
+Naive_Effector_filtered$Treg.naive[Naive_Effector_filtered$Treg.naive %in% Variable_genes] -> Naive_Effector_filtered$Treg.naive
+Naive_Effector_filtered$Treg.effector[Naive_Effector_filtered$Treg.effector %in% Variable_genes] -> Naive_Effector_filtered$Treg.effector
+
+
+
+SCINA(
+  scina.data,
+  Naive_Effector_filtered, 
+  max_iter = 100, 
+  convergence_n = 10, 
+  convergence_rate = 0.999, 
+  sensitivity_cutoff = 0.9,
+  rm_overlap = FALSE,
+  allow_unknown = TRUE) -> scina.results
+
+
+Treg_data_filtered$scina_labels <- scina.results$cell_labels
+
+```
+
+
+Figure 7b - UMAP with naive/effector
+------------------------------------
+
+```{r NaiveEffectors, fig.height=5, fig.width=4.5}
+
+DimPlot(Treg_data_filtered,reduction = "umap", pt.size = 2, label = TRUE, group.by = "scina_labels",
+        label.size = 5, cols = c("darkblue","darkorange2","grey"))+ theme(legend.position = "none", plot.title = element_blank())
+
+# ggsave("Naive_Effector_umap.pdf")
+
+```
+
+Figure S18b - naive/effector percentages per cluster
+-------------------------------------------------------
+
+```{r}
+
+Treg_data_filtered@meta.data %>%
+  group_by(seurat_clusters,scina_labels) %>%
+  count() %>%
+  group_by(seurat_clusters) %>%
+  mutate(percent=100*n/sum(n)) %>%
+  ungroup() %>%
+  ggplot(aes(x=seurat_clusters, y=percent, fill= scina_labels)) +
+  geom_col() +
+  scale_fill_manual(values = c("darkblue","darkorange2","grey")) +
+  ggtitle("Percentage of Naive cell per cluster") +
+    theme(legend.position = "none", plot.title = element_blank()) +
+    scale_y_continuous(expand = expansion(mult = c(0,0.05)))
+
+# ggsave("Naive_Effector_barplot.pdf")
+
+
+```
+
+
+Finding Markers for each Cluster
+================================
+
+Using the ```FindMarkers``` function in Seurat to identify genes which are markers for a given cluster.  
+
+Using the default test - Wilcox rank sum test.  This identifies genes which are differentially regulated between two groups of cells.  We will test each cluster against all cells that do not belong to that cluster
+
+
+
+
+```{r}
+
+lapply(
+  levels(Treg_data_filtered[["seurat_clusters"]][[1]]),
+  function(x)FindMarkers(Treg_data_filtered,ident.1 = x,min.pct = 0.25)
+) -> cluster.markers
+
+
+
+```
+
+```{r}
+cluster.markers %>%
+  set_names(0:(length(cluster.markers)-1)) %>%
+  map(as_tibble, rownames = "gene") %>%
+  map(arrange, p_val_adj) %>%
+  bind_rows(.id = "cluster") -> cluster.markers
+
+cluster.markers
+
+#cluster.markers %>%
+#  write_tsv("cluster_markers_table.txt")
+```
+
+```{r}
+cluster.markers %>%
+  filter(avg_log2FC > 0) %>%
+  filter(!gene == "Gm36660") %>% # this is a likely artefact due to proximity to Zfp36l1 (read-through since TTS deleted in KO)
+  filter(!(gene == "Ly6c1" & cluster == "5")) %>% # also enriched in cluster 1 - no need to show twice
+  arrange(desc(avg_log2FC)) %>%
+  group_by(cluster) %>%
+  slice(1:4) %>%
+  ungroup() %>%
+  pull(gene) -> top_marker_genes
+```
+
+
+Figure 7c - dotplot of marker genes
+---------------------------------------
+
+```{r fig.height=4, fig.width=7}
+DotPlot(Treg_data_filtered, features= top_marker_genes, cols =c("lightblue","blue"), col.max= 1.5, col.min = -1.5) + RotatedAxis()
+
+#ggsave("dotplot_top_markers.pdf")
+
+```
+
+
+Defining cells with an IFNg signature
+======================================
+
+
+Using SCINA, as for naive/effector Treg. 
+
+(gene list in manuscript supplementary tables)
+
+```{r}
+preprocess.signatures("Interferon gamma.csv") -> Interferon
+
+
+SCINA(
+  scina.data,
+  Interferon, 
+  max_iter = 100, 
+  convergence_n = 10, 
+  convergence_rate = 0.999, 
+  sensitivity_cutoff = 0.9, 
+  rm_overlap= FALSE, 
+  allow_unknown=TRUE
+) -> scina.results.interferon
+
+Treg_data_filtered$scina_labels_interferon <- scina.results.interferon$cell_labels
+
+```
+
+
+Figure 7e (L) - IFNg signature UMAP
+-----------------------------------
+
+```{r fig.height=5, fig.width=7}
+DimPlot(Treg_data_filtered,reduction = "umap", pt.size = 2, label = FALSE, group.by = "scina_labels_interferon", split.by = "Genotype", cols = c("red","grey"), shuffle = TRUE) +
+  theme(legend.position = "none", plot.title = element_blank())
+
+#ggsave("Ifng_UMAP.pdf")
+```
+
+
+```{r}
+
+
+
+
+Treg_data_filtered@meta.data %>%
+  group_by(seurat_clusters,scina_labels_interferon) %>%
+  count() %>%
+  group_by(seurat_clusters) %>%
+  mutate(percent=100*n/sum(n)) %>%
+  ungroup() %>%
+  ggplot(aes(x=seurat_clusters, y=percent, fill= scina_labels_interferon)) +
+  geom_col() +
+  scale_fill_manual(values = c("red", "grey"))
+
+Treg_data_filtered@meta.data %>%
+  ggplot(aes(Genotype,fill= scina_labels_interferon)) +
+  geom_bar() +
+  facet_wrap(vars(seurat_clusters)) +
+  theme_bw() +
+  scale_fill_manual(values = c("red","grey")) 
+
+
+```
+
+Figure 7e (R) - IFNg signature by cluster
+------------------------------------------
+
+```{r fig.height=5, fig.width=7}
+
+Treg_data_filtered@meta.data %>%
+  ggplot(aes(Genotype,fill= scina_labels_interferon)) +
+  geom_bar(position = "fill") +
+  facet_wrap(vars(seurat_clusters)) +
+  theme_bw() +
+  scale_fill_manual(values = c("red","grey"))
+
+#ggsave("Ifng_signature_clusters.pdf")
+
+```
+
+```{r}
+Treg_data_filtered@meta.data %>%
+  group_by(Genotype, seurat_clusters, scina_labels_interferon) %>%
+  count() %>%
+  ungroup() %>%
+  pivot_wider(names_from = Genotype, values_from = n) %>%
+  nest(data = -seurat_clusters) %>%
+  mutate(chisq = map(data, ~ {
+    .x %>%
+      column_to_rownames("scina_labels_interferon") %>%
+      chisq_test() %>%
+      as_tibble()
+  })) %>%
+  unnest(chisq) %>%
+  adjust_pvalue("p", method = "fdr") %>%
+  select(-data)# %>%
+#  write_tsv("Ifng_clusters_chisq_test.txt")
+```
+
+
+Figure 7f - expression of specific genes on UMAP
+================================================
+
+```{r fig.height=4, fig.width=6.5}
+FeaturePlot(Treg_data_filtered,reduction= "umap", features="Cxcr3", split.by = "Genotype", pt.size = 1.5) + theme(legend.position = "right")
+
+```
+```{r fig.height=4, fig.width=6.5}
+FeaturePlot(Treg_data_filtered,reduction= "umap", features="Gata3", split.by = "Genotype", pt.size = 1.5) + theme(legend.position = "right")
+
+```
+
+```{r fig.height=4, fig.width=6.5}
+FeaturePlot(Treg_data_filtered,reduction= "umap", features="Pdcd1", split.by = "Genotype", pt.size = 1.5) + theme(legend.position = "right")
+
+```

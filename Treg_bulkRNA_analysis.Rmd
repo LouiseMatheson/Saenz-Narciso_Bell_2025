@@ -1,0 +1,1823 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+library(DESeq2)
+library(rtracklayer)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(RColorBrewer)
+library(gridExtra)
+library(grid)
+library(pheatmap)
+library(tidyverse)
+library(ggrepel)
+library(rstatix)
+
+options(stringsAsFactors = F)
+
+theme_set(theme_classic()) 
+theme_update(plot.background = element_blank(), 
+             panel.background = element_blank(), 
+             legend.background = element_blank(), 
+             legend.key = element_blank())
+
+```
+
+# Functions
+
+
+## Read count processing
+
+File/function for sorting out nomenclature for Seqmonk output using v90 annotation - contains many duplicate gene names, some of these resolved if the appropriate newer name for one of the duplicates is used. Some are genes with isoforms that do not overlap and output two rows (I believe newer versions of Seqmonk have resolved this issue) so the appropriate action is to add them together. For others they are overlapping and one should be removed.
+Also allows optional exclusion of Y chromosome and Xist/Tsix (or entire X), and of predicted genes very close to ZFP36 family genes that artefactually appear altered as a result of the deletion. 
+
+```{r}
+try(GRCm38_v90_nomenclature <- read_tsv("Useful_stuff/GRCm38_v90_nomenclature.txt", col_types = cols(Chromosome = col_character(), mRNA_duplicates = col_character())), silent = T)
+
+RNA_seqmonk_to_corrected_counts <- function(expression_data, XYexclude = "normal", MTexclude = F, Zfp36exclude = NULL, silent = F){
+  expression_data$Probe <- as.character(expression_data$Probe)
+  start_col <- which(colnames(expression_data) == "Distance") + 1
+  try(mRNA_duplication <- read.delim("Useful_stuff/duplicated_probe_in_mRNA.txt", stringsAsFactors = F), silent  = silent)
+ if(!exists("mRNA_duplication")) { print("mRNA_duplication file not found!")}
+  GRCm38_name_changes <- GRCm38_v90_nomenclature[GRCm38_v90_nomenclature$name_change==T,]
+  expression_data$Gene_name <- expression_data$Probe
+  expression_data$gene_and_location <- paste(expression_data$Probe, expression_data$Chromosome,expression_data$Start, expression_data$End,expression_data$Probe.Strand)
+  expression_data$Gene_name[expression_data$gene_and_location %in% GRCm38_name_changes$gene_and_location] <- GRCm38_name_changes$Gene_name[match(expression_data$gene_and_location[expression_data$gene_and_location %in% GRCm38_name_changes$gene_and_location], GRCm38_name_changes$gene_and_location)]
+  GRCm38_name_changes <- GRCm38_name_changes[!GRCm38_name_changes$gene_and_location %in% expression_data$gene_and_location,]
+  expression_data$Gene_name[expression_data$Probe %in% GRCm38_name_changes$Probe] <- GRCm38_name_changes$Gene_name[match(expression_data$Probe[expression_data$Probe %in% GRCm38_name_changes$Probe], GRCm38_name_changes$Probe)]
+  expression_data <- expression_data[!expression_data$gene_and_location %in% mRNA_duplication$gene_and_location[mRNA_duplication$action=="exclude"],]
+  for(gene in na.omit(unique(mRNA_duplication$Probe[mRNA_duplication$action=="add"]))){
+    subset <- expression_data[expression_data$Probe == gene,]
+    expression_data$Start[expression_data$Probe == gene] <- min(subset$Start)
+    expression_data$End[expression_data$Probe == gene] <- max(subset$End)
+    for(i in start_col:(ncol(expression_data)-2)){
+      expression_data[expression_data$Probe == gene, i] <- sum(subset[,i])
+    }
+  }
+  expression_data <- expression_data[!duplicated(expression_data$Gene_name),]
+  if(MTexclude == T){
+    expression_data <- expression_data[!expression_data$Chromosome == "MT",]
+  }
+  if(XYexclude == "normal"){
+    expression_data <- expression_data[!(expression_data$Chromosome == "Y" | expression_data$Gene_name %in% c("Xist","Tsix","Gm26992")),]
+  }
+  if(XYexclude == "harsh"){
+    expression_data <- expression_data[!expression_data$Chromosome %in% c("X","Y"),]
+  }
+  try(Zfp36_confounders <- read.table("Useful_stuff/Zfp36_confounding_genes.txt"), silent = silent)
+  expression_data <- expression_data[!expression_data$Gene_name %in% Zfp36_confounders$V2[Zfp36_confounders$V1 %in% Zfp36exclude],]
+  rownames(expression_data) <- expression_data$Gene_name
+  expression_data <- expression_data[,c(start_col:(ncol(expression_data)-2))]
+}
+
+```
+
+## Plotting count data
+
+```{r}
+plot_FYC <- function(genes) {
+  nTreg_FYC_norm_counts %>%
+    filter(Gene %in% genes) %>%
+    pivot_longer(ends_with("bam"), names_to = "Sample", values_to = "Norm_counts") %>%
+    mutate(Sample = sub("_mer.*", "", Sample)) %>%
+    mutate(Genotype = if_else(grepl("RV", Sample), "Ctrl", "KO")) %>%
+    mutate(Gene = factor(Gene, levels = unique(genes))) %>%
+    ggplot(aes(x = 1, y = Norm_counts, fill = Genotype, shape = Genotype)) +
+      stat_summary(geom = "bar", fun = mean, position = "dodge", colour = "black") +
+      geom_point(position = position_jitterdodge(dodge.width = 0.9, jitter.width = 0.2)) +
+      scale_fill_manual(values = c("grey50", "white")) +
+      scale_shape_manual(values = c(19,1)) +
+      labs(x = NULL, y = "Normalised read counts") +
+      scale_y_continuous(expand = expansion(mult = c(0,0.05))) +
+      facet_wrap(~Gene, scales = "free_y") +
+      theme_bw() +
+      theme(panel.background = element_blank(), plot.background = element_blank(), legend.background = element_blank(), legend.key = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank())
+}
+```
+
+
+## GSEA data
+
+Function for extracting data from GSEA output
+
+```{r}
+getGSEAdata <- function(path, gene.set, class.name, metric.range) {
+  
+  if (missing(path)) {
+    stop("Path argument is required")
+  }
+  if (!file.exists(path)) {
+    stop("The path folder could not be found. Please change the path")
+  }
+  if (missing(gene.set)) {
+    stop("Gene set argument is required")
+  }
+  
+  gsea_output <- list()
+  
+  ## Load .rnk data
+  path.rnk <- list.files(path = file.path(path),
+                         pattern = ".rnk$", full.names = TRUE)
+  gsea_output$gsea.rnk <- read.delim(file = path.rnk, header = FALSE)
+  colnames(gsea_output$gsea.rnk) <- c("mgi.symbol", "metric")
+  if (missing(metric.range)) {
+    metric.range <- c(min(gsea_output$gsea.rnk$metric), max(gsea_output$gsea.rnk$metric))
+  }  
+  
+  ## Load .edb data
+  path.edb <- list.files(path = file.path(path),
+                         pattern = ".edb$", full.names = TRUE)
+  gsea.edb <- read.delim(file = path.edb,
+                         header = FALSE, stringsAsFactors = FALSE)
+  gsea.edb <- unlist(gsea.edb)
+  gsea.metric <- gsea.edb[grep("METRIC=", gsea.edb)]
+  gsea.metric <- unlist(strsplit(gsea.metric, " "))
+  gsea.metric <- gsea.metric[grep("METRIC=", gsea.metric)]
+  gsea.metric <- gsub("METRIC=", "", gsea.metric)
+  gsea.edb <- gsea.edb[grep("<DTG", gsea.edb)]
+  
+  # Select the right gene set
+  if (length(gsea.edb) == 0) {
+    stop(paste("The gene set name was not found, please provide",
+               "a correct name"))
+  }
+  if (length(grep(paste0("gmt#",gsub(".\\$(.*$)", "\\1", gene.set), " "), gsea.edb)) > 1) {
+    warning(paste("More than 1 gene set matched the gene.set",
+                  "argument; the first match is plotted"))
+  }
+  gsea.edb <- gsea.edb[grep(paste0("gmt#",gsub(".\\$(.*$)", "\\1", gene.set), " "), gsea.edb)[1]]
+  
+  # Get template name
+  gsea_output$gsea.template <-sub(".*TEMPLATE=(.*) GENESET.*", "\\1", gsea.edb)
+  
+  # Get gene set name
+  gsea_output$gsea.gene.set <- sub(".*gmt#(.*) ES=.*","\\1", gsea.edb)
+  
+  # Get enrichment score
+  gsea_output$gsea.enrichment.score <- as.numeric(sub(".*ES=(.*) NES=.*","\\1", gsea.edb))
+  
+  # Get gene set name
+  gsea_output$gsea.normalized.enrichment.score <- as.numeric(sub(".*NES=(.*) NP=.*","\\1", gsea.edb))
+  
+  # Get nominal p-value
+  gsea_output$gsea.p.value <- as.numeric(sub(".*NP=(.*) FDR=.*","\\1", gsea.edb))
+  
+  # Get FDR
+  gsea_output$gsea.fdr <- as.numeric(sub(".*FDR=(.*) FWER=.*","\\1", gsea.edb))
+  
+  # Get hit indices
+  gsea_output$gsea.hit.indices <- as.integer(unlist(strsplit(sub(".*HIT_INDICES=(.*) ES_PROFILE.*", "\\1", gsea.edb), " ")))
+  
+  # Get ES profile
+  gsea_output$gsea.es.profile <- as.numeric(unlist(strsplit(sub(".*ES_PROFILE=(.*) RANK_AT.*", "\\1", gsea.edb), " ")))
+  
+  # Create df for plotting ES - need to include decay in ES for every gene that is not a hit
+  ES_all_hits <- data.frame(hit_indices = c(0,gsea_output$gsea.hit.indices,nrow(gsea_output$gsea.rnk)), es_profile = c(0,gsea_output$gsea.es.profile,0), eliminate = c(T, rep(F, length(gsea_output$gsea.es.profile)), T))
+  ES_decay_rate <- 1/(nrow(gsea_output$gsea.rnk) - length(gsea_output$gsea.hit.indices))
+  ES_preceding_hits <- data.frame(hit_indices = numeric(), es_profile = numeric(), eliminate = logical())
+  for(i in 2:(nrow(ES_all_hits)-1)) {
+    if((ES_all_hits$hit_indices[i] - ES_all_hits$hit_indices[i-1]) > 1) {
+      preceding_index <- ES_all_hits$hit_indices[i] - 1
+      preceding_ES <- ES_all_hits$es_profile[i-1] - (ES_decay_rate * (ES_all_hits$hit_indices[i] - ES_all_hits$hit_indices[i-1] - 1))
+      ES_preceding_hits[nrow(ES_preceding_hits) + 1,] <- c(preceding_index, preceding_ES, T)
+    }
+  }
+  gsea_output$enrichment_df <- rbind(ES_all_hits, ES_preceding_hits)
+  return(gsea_output)
+}
+```
+
+
+Function for reading in and plotting a single GSEA result - allows colouring by ARE as well as CLIP
+
+```{r}
+GSEA_plot_single <- function(folder, geneset, title = geneset, colour = "royalblue3", withCLIP = F, withCLIPARE = F, CLIPcol = "darkorange1", CLIPAREcol = c("mediumseagreen", "darkorange1", "navy")) {
+  gsea_data <- getGSEAdata(folder, geneset)
+  
+  gsea_data$gsea.rnk$rank <- 0:(nrow(gsea_data$gsea.rnk)-1)
+  
+  gsea_enrich <- gsea_data$enrichment_df
+  
+  leading_edge <- if_else(gsea_data$gsea.normalized.enrichment.score > 0, gsea_enrich$hit_indices[gsea_enrich$es_profile == max(gsea_enrich$es_profile)], gsea_enrich$hit_indices[gsea_enrich$es_profile == min(gsea_enrich$es_profile)])
+  LE_hjust <- if_else(gsea_data$gsea.normalized.enrichment.score > 0, 1, 0)
+  LE_vjust <- if_else(gsea_data$gsea.normalized.enrichment.score > 0, 0, 1)
+  LE_label_offset_x <- if_else(gsea_data$gsea.normalized.enrichment.score > 0, -100, 100)
+  LE_label_offset_y <- if_else(gsea_data$gsea.normalized.enrichment.score > 0, 0.02, -0.02)
+  
+  if(withCLIP == F & withCLIPARE == F) {
+    ggplot(gsea_enrich)+
+      geom_hline(yintercept = 0, colour = "grey40")+
+      geom_line(size = 1, aes(x = hit_indices, y = es_profile), colour = colour)+
+      ylab("Enrichment score")+
+      scale_x_continuous(name = "Gene ranking", expand = c(0.01,0))+
+      geom_rect(data = gsea_enrich[gsea_enrich$eliminate == F,],aes(xmin = hit_indices-0.5, xmax = hit_indices+0.5, ymin = min(gsea_enrich$es_profile, 0)-0.03, ymax = min(gsea_enrich$es_profile, 0)-0.13), fill = colour) + 
+      annotate("text", x = 12000, y = max(gsea_enrich$es_profile)-0.1, hjust = 1, 
+               label = paste0("NES = ", gsea_data$gsea.normalized.enrichment.score, "; FDR = ", gsea_data$gsea.fdr)) + 
+      geom_vline(xintercept = leading_edge, linetype = "dashed", size = 0.5) +
+      annotate("text", x = leading_edge+LE_label_offset_x, y = LE_label_offset_y, hjust = LE_hjust, vjust = LE_vjust, label = "Leading\nedge", size = 3) +
+      ggtitle(title)
+  } else if(withCLIPARE == F) {
+    gsea_data$gsea.rnk %>%
+      filter(mgi.symbol %in% All_CD4_CLIP_3UTR_targets) %>%
+      select(rank) %>%
+      deframe() -> CLIP_target_ranks
+    ggplot(gsea_enrich)+
+      geom_hline(yintercept = 0, colour = "grey40")+
+      geom_line(size = 1, aes(x = hit_indices, y = es_profile), colour = colour)+
+      ylab("Enrichment score")+
+      scale_x_continuous(name = "Gene ranking", expand = c(0.01,0))+
+      geom_segment(data = gsea_enrich[gsea_enrich$eliminate == F,],aes(x = hit_indices, xend = hit_indices, y = min(gsea_enrich$es_profile, 0)-0.03, yend = min(gsea_enrich$es_profile, 0)-0.13, colour = hit_indices %in% CLIP_target_ranks)) + 
+      annotate("text", x = 12000, y = max(gsea_enrich$es_profile)-0.1, hjust = 1, 
+               label = paste0("NES = ", gsea_data$gsea.normalized.enrichment.score, "; FDR = ", gsea_data$gsea.fdr)) + 
+      geom_vline(xintercept = leading_edge, linetype = "dashed", size = 0.4) +
+      annotate("text", x = leading_edge+LE_label_offset_x, y = LE_label_offset_y, hjust = LE_hjust, vjust = LE_vjust, label = "Leading\nedge", size = 3) +
+      ggtitle(title) +
+      scale_colour_manual(name = "CLIP target", values = c("grey40",CLIPcol))
+  } else {
+    gsea_data$gsea.rnk %>%
+      filter(mgi.symbol %in% All_CD4_CLIP_3UTR_targets) %>%
+      select(rank) %>%
+      deframe() -> CLIP_target_ranks
+    gsea_data$gsea.rnk %>%
+      filter(mgi.symbol %in% all_genes_with_ARE) %>%
+      select(rank) %>%
+      deframe() -> ARE_target_ranks
+    gsea_enrich %>%
+      mutate(CLIP_ARE = case_when(
+        hit_indices %in% CLIP_target_ranks & hit_indices %in% ARE_target_ranks ~ "CLIP_ARE",
+        hit_indices %in% CLIP_target_ranks ~ "CLIP",
+        hit_indices %in% ARE_target_ranks ~ "ARE",
+        TRUE ~ "None"
+      )) -> gsea_enrich
+    ggplot(gsea_enrich)+
+      geom_hline(yintercept = 0, colour = "grey40")+
+      geom_line(size = 1, aes(x = hit_indices, y = es_profile), colour = colour)+
+      ylab("Enrichment score")+
+      scale_x_continuous(name = "Gene ranking", expand = c(0.01,0))+
+      geom_segment(data = gsea_enrich[gsea_enrich$eliminate == F,],aes(x = hit_indices, xend = hit_indices, y = min(gsea_enrich$es_profile, 0)-0.03, yend = min(gsea_enrich$es_profile, 0)-0.13, colour = CLIP_ARE)) + 
+      annotate("text", x = 12000, y = max(gsea_enrich$es_profile)-0.1, hjust = 1, 
+               label = paste0("NES = ", gsea_data$gsea.normalized.enrichment.score, "; FDR = ", gsea_data$gsea.fdr)) + 
+      geom_vline(xintercept = leading_edge, linetype = "dashed", size = 0.4) +
+      annotate("text", x = leading_edge+LE_label_offset_x, y = LE_label_offset_y, hjust = LE_hjust, vjust = LE_vjust, label = "Leading\nedge", size = 3) +
+      ggtitle(title) +
+      scale_colour_manual(name = NULL, values = c(CLIPAREcol, "grey40"))
+  }
+}
+```
+
+
+Function for reading in and plotting >1 GSEA result on same plot
+
+```{r}
+GSEA_plot_multi <- function(paths, gene.sets, names = gene.sets, colours = c("#1B9E77","#D95F02","#7570B3","#E7298A","#66A61E","#E6AB02","#A6761D","#666666"), title = NULL, legend = T, withCLIP = F, CLIPcol = "darkorange", leadingEdge = F) {
+  if (missing(paths)) {
+    stop("Paths argument is required")
+  }
+  paths <- sub("/$", "", paths)
+  if(length(paths) == 1){
+    paths = rep(paths, length(gene.sets))
+  }
+  if(length(paths) != length(gene.sets)) {
+    stop("paths argument must be either length 1 or the same length as the number of gene sets")
+  }
+  if(length(names) != length(gene.sets)) {
+    stop("names argument must be either length 1 or the same length as the number of gene sets")
+  }
+  if (any(!file.exists(paths))) {
+    stop(paste0("The following path folder(s) could not be found. Please change the path:\n", paste(paths[which(!file.exists(paths))], collapse = "\n")))
+  }
+  if (missing(gene.sets)) {
+    stop("Gene set argument is required")
+  }
+  if(length(colours) < length(gene.sets)) {
+    colours <- rep(colours, 1+(length(gene.sets) %/% length(colours)))
+    warning("Fewer colours provided than gene sets: colours will be recycled")
+  }
+  colours <- colours[1:length(gene.sets)]
+  
+  gsea_all_NES <- list()
+  gsea_all_FDR <- list()
+  gsea_all_enrich <- list()
+  gsea_all_rnk <- list()
+  gsea_LE <- list()
+  for(j in 1:length(gene.sets)) {
+    gsea_output <- list()
+    gene.set <- gene.sets[j]
+    path <- paths[j]
+    
+    ## Load .rnk data
+    path.rnk <- list.files(path = file.path(path),
+                           pattern = ".rnk$", full.names = TRUE)
+    gsea_output$gsea.rnk <- read_tsv(file = path.rnk, col_names = c("Gene", "score"))
+    
+    ## Load .edb data
+    path.edb <- list.files(path = file.path(path),
+                           pattern = ".edb$", full.names = TRUE)
+    gsea.edb <- read.delim(file = path.edb,
+                           header = FALSE, stringsAsFactors = FALSE)
+    gsea.edb <- unlist(gsea.edb)
+    gsea.edb <- gsea.edb[grep("<DTG", gsea.edb)]
+    
+    # Select the right gene set
+    if (length(gsea.edb) == 0) {
+      stop(paste("The gene set name was not found, please provide",
+                 "a correct name"))
+    }
+    if (length(grep(paste0("gmt#",gsub(".\\$(.*$)", "\\1", gene.set), " ES="), gsea.edb)) > 1) {
+      warning(paste("More than 1 gene set matched the gene.set",
+                    "argument; the first match is plotted"))
+    }
+    gsea.edb <- gsea.edb[grep(paste0("gmt#",gsub(".\\$(.*$)", "\\1", gene.set), " ES="), gsea.edb)[1]]
+    
+    # Get gene set name
+    gsea_output$gsea.gene.set <- sub(".*gmt#(.*) ES=.*","\\1", gsea.edb)
+    
+    # Get enrichment score
+    gsea_output$gsea.enrichment.score <- as.numeric(sub(".*ES=(.*) NES=.*","\\1", gsea.edb))
+    
+    # Get gene set name
+    gsea_output$gsea.normalized.enrichment.score <- as.numeric(sub(".*NES=(.*) NP=.*","\\1", gsea.edb))
+    
+    # Get nominal p-value
+    gsea_output$gsea.p.value <- as.numeric(sub(".*NP=(.*) FDR=.*","\\1", gsea.edb))
+    
+    # Get FDR
+    gsea_output$gsea.fdr <- as.numeric(sub(".*FDR=(.*) FWER=.*","\\1", gsea.edb))
+    
+    # Get rank at leading edge
+    gsea_output$gsea.LErank <- as.numeric(sub(".*RANK_AT_ES=(.*) RANK_SCORE.*","\\1", gsea.edb))
+    
+    # Get hit indices
+    gsea_output$gsea.hit.indices <- as.integer(unlist(strsplit(sub(".*HIT_INDICES=(.*) ES_PROFILE.*", "\\1", gsea.edb), " ")))
+    
+    # Get ES profile
+    gsea_output$gsea.es.profile <- as.numeric(unlist(strsplit(sub(".*ES_PROFILE=(.*) RANK_AT.*", "\\1", gsea.edb), " ")))
+    
+    # Create df for plotting ES - need to include decay in ES for every gene that is not a hit
+    ES_all_hits <- data.frame(hit_indices = c(0,gsea_output$gsea.hit.indices,nrow(gsea_output$gsea.rnk)), es_profile = c(0,gsea_output$gsea.es.profile,0), eliminate = c(T, rep(F, length(gsea_output$gsea.es.profile)), T))
+    ES_decay_rate <- 1/(nrow(gsea_output$gsea.rnk) - length(gsea_output$gsea.hit.indices))
+    ES_preceding_hits <- data.frame(hit_indices = numeric(), es_profile = numeric(), eliminate = logical())
+    for(i in 2:(nrow(ES_all_hits)-1)) {
+      if((ES_all_hits$hit_indices[i] - ES_all_hits$hit_indices[i-1]) > 1) {
+        preceding_index <- ES_all_hits$hit_indices[i] - 1
+        preceding_ES <- ES_all_hits$es_profile[i-1] - (ES_decay_rate * (ES_all_hits$hit_indices[i] - ES_all_hits$hit_indices[i-1] - 1))
+        ES_preceding_hits[nrow(ES_preceding_hits) + 1,] <- c(preceding_index, preceding_ES, T)
+      }
+    }
+    gsea_output$enrichment_df <- rbind(ES_all_hits, ES_preceding_hits)
+    
+    gsea_output$gsea.rnk$rank <- 0:(nrow(gsea_output$gsea.rnk)-1)
+    
+    gsea_all_NES[[j]] <- gsea_output$gsea.normalized.enrichment.score
+    gsea_all_FDR[[j]] <- gsea_output$gsea.fdr
+    gsea_all_enrich[[names[j]]] <- gsea_output$enrichment_df
+    gsea_all_rnk[[j]] <- gsea_output$gsea.rnk
+    gsea_LE[[j]] <- if(gsea_output$gsea.normalized.enrichment.score > 0) {
+      tibble(
+        x = gsea_output$enrichment_df$hit_indices[gsea_output$enrichment_df$es_profile == max(gsea_output$enrichment_df$es_profile)], 
+        y = max(gsea_output$enrichment_df$es_profile)
+      )
+    } else {
+      tibble(
+        x = gsea_output$enrichment_df$hit_indices[gsea_output$enrichment_df$es_profile == min(gsea_output$enrichment_df$es_profile)], 
+        y = min(gsea_output$enrichment_df$es_profile)
+      )
+    }
+  }
+  gsea_all_enrich %>%
+    bind_rows(.id = "geneset") %>%
+    mutate(geneset = factor(geneset, levels = names)) %>%
+    mutate(yOffset = as.numeric(as.character(factor(geneset, levels = names, labels = seq(0.03, by = 0.1, length.out = length(names)))))) -> gsea_all_enrich
+  
+  annotation_yvals <- seq(max(gsea_all_enrich$es_profile), min(gsea_all_enrich$es_profile), length.out = length(names) + 5)[2:(length(names)+1)]
+  
+  if(withCLIP == F) {
+    ggplot(gsea_all_enrich)+
+      geom_hline(yintercept = 0, colour = "grey40")+
+      geom_line(size = 1, aes(x = hit_indices, y = es_profile, colour = geneset))+
+      ylab("Enrichment score")+
+      scale_x_continuous(name = "Gene ranking", expand = c(0.01,0))+
+      geom_segment(data = gsea_all_enrich[gsea_all_enrich$eliminate == F,],aes(x = hit_indices, xend = hit_indices, y = min(gsea_all_enrich$es_profile, 0)-as.numeric(yOffset), yend = min(gsea_all_enrich$es_profile, 0)-(0.1+yOffset), colour = geneset)) + 
+      scale_colour_manual(values = colours, name = NULL) + 
+      annotate("text", x = max(gsea_all_enrich$hit_indices)-500, y = annotation_yvals, hjust = 1, 
+               label = paste0("NES = ", gsea_all_NES, "; FDR = ", gsea_all_FDR), 
+               colour = colours) + 
+      ggtitle(title) +
+      theme_classic() +
+      theme(plot.background = element_blank(), panel.background = element_blank(), legend.background = element_blank(), legend.key = element_blank()) -> pGSEA
+  } else {
+    gsea_all_rnk[[1]] %>%
+      filter(Gene %in% All_CD4_CLIP_3UTR_targets) %>%
+      select(rank) %>%
+      deframe() -> CLIP_target_ranks
+    ggplot(gsea_all_enrich)+
+      geom_hline(yintercept = 0, colour = "grey40")+
+      geom_line(size = 1, aes(x = hit_indices, y = es_profile, colour = geneset))+
+      ylab("Enrichment score")+
+      scale_x_continuous(name = "Gene ranking", expand = c(0.01,0))+
+      geom_segment(data = gsea_all_enrich[gsea_all_enrich$eliminate == F,],aes(x = hit_indices, xend = hit_indices, y = min(gsea_all_enrich$es_profile, 0)-as.numeric(yOffset), yend = min(gsea_all_enrich$es_profile, 0)-(0.1+yOffset), colour = hit_indices %in% CLIP_target_ranks)) + 
+      scale_colour_manual(values = c("grey40", CLIPcol, colours), breaks = c(F,T,names), name = NULL) + 
+      annotate("text", x = max(gsea_all_enrich$hit_indices)-500, y = annotation_yvals, hjust = 1, 
+               label = paste0("NES = ", gsea_all_NES, "; FDR = ", gsea_all_FDR), 
+               colour = colours) + 
+      ggtitle(title) +
+      theme_classic() +
+      theme(plot.background = element_blank(), panel.background = element_blank(), legend.background = element_blank(), legend.key = element_blank()) +
+      scale_fill_gradientn(name = "-log10(pval)", colours = c(colorRampPalette(brewer.pal(11, "RdBu")[11:10])(300), colorRampPalette(brewer.pal(11, "RdBu")[10:7])(200), colorRampPalette(brewer.pal(11, "RdBu")[7:5])(10), colorRampPalette(brewer.pal(11, "RdBu")[5:2])(200), colorRampPalette(brewer.pal(11, "RdBu")[2:1])(300)), limits = c(-max(abs(gsea_all_rnk[[1]]$score)), max(abs(gsea_all_rnk[[1]]$score)))) -> pGSEA
+  }
+  
+  if(legend == F) {
+    pGSEA + theme(legend.position = "none") -> pGSEA
+  }
+  if(leadingEdge == T) {
+    gsea_LE %>%
+      bind_rows() -> gsea_LE
+    pGSEA + annotate("segment", x = gsea_LE$x, xend = gsea_LE$x, y = 0, yend = gsea_LE$y, linetype = "dashed") -> pGSEA
+  }
+  return(pGSEA)
+}
+
+```
+
+## Generating expression-matched control gene list for a gene set of interest
+
+```{r}
+ExpressionMatch <- function(countData, resData, geneSets, geneSetNames = NA, resCol = NA, geneCol = NA, nRandom = 20, 
+                            baseMeanGrep = "", newCol = "Expression_matched_genes", avoid_genes = NULL, UTR3p = F, UTRdata = NULL, 
+                            UTRthreshold = 80){
+  countData <- as.data.frame(countData)
+  resData <- as.data.frame(resData)
+  countData$baseMean <- rowMeans(countData[,grepl(baseMeanGrep, colnames(countData))])
+  geneSet_counts <- list()
+  if(is.na(geneCol)){
+    countData <- countData[rownames(countData) %in% rownames(resData),]
+  }
+  else {
+    countData <- countData[rownames(countData) %in% resData$geneCol,]
+  }
+  if(is.na(resCol)){
+    resData[,newCol] <- NA
+    if(is.na(geneSetNames)){
+      geneSetNames <- paste("geneSet",1:length(geneSets),sep = "_")
+    }
+    for(i in 1:length(geneSets)){
+      if(is.na(geneCol)){
+        resData[rownames(resData) %in% geneSets[[i]],newCol] <- geneSetNames[i]
+      }
+      else {
+        resData[resData[,geneCol] %in% geneSets[[i]],newCol] <- geneSetNames[i]
+      }
+    }
+    for(i in 1:length(geneSets)){
+      genes_in_set <- geneSets[[i]]
+      geneSet_counts[[i]] <- countData[rownames(countData) %in% genes_in_set,]
+      countData <- countData[!rownames(countData) %in% genes_in_set,]
+    }
+  }
+  else {
+    resData[,newCol] <- as.character(resData[,resCol])
+    if(is.na(geneSetNames)){
+      geneSetNames <- geneSets
+    }
+    for(i in 1:length(geneSets)){
+      resData[,newCol] <- gsub(geneSets[i], geneSetNames[i], resData[,newCol])
+      if(is.na(geneCol)){
+        genes_in_set <- rownames(resData)[resData[,resCol] == geneSets[i]]
+      }
+      else {
+        genes_in_set <- resData[resData[,resCol] == geneSets[i], geneCol]
+      }
+      geneSet_counts[[i]] <- countData[rownames(countData) %in% genes_in_set,]
+      countData <- countData[!rownames(countData) %in% genes_in_set,]
+    }
+  }
+  countData <- countData[!rownames(countData) %in% avoid_genes,]
+  if(UTR3p == T){
+    geneSet_UTRs <- list()
+    for(i in 1:length(geneSets)){
+      geneSet_UTRs[[i]] <- UTRdata[match(rownames(geneSet_counts[[i]]),rownames(UTRdata)),1]
+    }
+    UTRdata <- na.omit(UTRdata)
+    UTRdata$threshold <- UTRdata[,1] > UTRthreshold
+    UTRdata <- UTRdata[UTRdata$threshold == T,]
+    countData <- countData[rownames(countData) %in% rownames(UTRdata),]
+  }
+  for(i in 1:length(geneSets)){
+    expression_matched_genes <- character()
+    for(j in 1:nrow(geneSet_counts[[i]])){
+      if(UTR3p==T){
+        UTRdata1 <- UTRdata[rownames(UTRdata) %in% rownames(countData),]
+        utr_length <- geneSet_UTRs[[i]][j]
+        utr_min <- floor(0.75*utr_length)
+        utr_max <- ceiling(1.25*utr_length)
+        genes_to_keep <- rownames(UTRdata1)[UTRdata1[,1] > utr_min & UTRdata1[,1] < utr_max]
+        if(length(genes_to_keep) < 1000){
+          UTRdata1$diff <- abs(UTRdata1[,1] - utr_length)
+          genes_to_keep <- rownames(UTRdata1[order(UTRdata1$diff),])[1:1000]
+        }
+        countData1 <- countData[rownames(countData) %in% genes_to_keep,]
+      }
+      else {
+        countData1 <- countData
+      }
+      closest_gene_index <- sample(order(abs(countData1$baseMean - geneSet_counts[[i]]$baseMean[j]))[1:nRandom],1)
+      expression_matched_genes[j] <- rownames(countData1)[closest_gene_index]
+      countData <- countData[!rownames(countData) == rownames(countData1)[closest_gene_index],]
+    }
+    if(is.na(geneCol)){
+      resData[rownames(resData) %in% expression_matched_genes,newCol] <- paste("Expression matched to",geneSetNames[i])
+    }
+    else {
+      resData[resData[,geneCol] %in% expression_matched_genes,newCol] <- paste("Expression matched to",geneSetNames[i])
+    }
+  }
+  return(resData)
+}
+  
+```
+
+Implemented in a loop to generate multiple controls sets
+
+```{r}
+ExpressionMatch_multi <- function(nSets, countData, resData, geneSets, geneSetNames = NA, resCol = NA, geneCol = NA, nRandom = 100, baseMeanGrep = "", newCol = "Expression_matched_genes", avoid_genes = NULL, UTR3p = F, UTRdata = NULL, UTRthreshold = 10){
+  if(is.na(geneSetNames)){
+    if(is.na(resCol)){
+      geneSetNames <- paste("geneSet",1:length(geneSets),sep = "_")
+    }
+    else {
+      geneSetNames <- geneSets
+    }
+  }
+  expression_matched_sets <- list()
+  for(s in 1:nSets){
+    expression_matched_sets[[s]] <- list()
+    eM <- ExpressionMatch(countData = countData, resData = resData, geneSets = geneSets, geneSetNames = geneSetNames, resCol = resCol, 
+                          geneCol = geneCol, nRandom = nRandom, baseMeanGrep = baseMeanGrep, newCol = newCol, avoid_genes = avoid_genes, 
+                          UTR3p = UTR3p, UTRdata = UTRdata, UTRthreshold = UTRthreshold)
+    eM_levels <- levels(na.omit(as.factor(eM[,newCol])))
+    eM_levels <- eM_levels[!eM_levels %in% geneSetNames]
+    for(l in eM_levels){
+      if(is.na(geneCol)){
+        expression_matched_sets[[s]][[as.character(l)]] <- as.character(na.omit(rownames(eM)[eM[,newCol]== l]))
+      }
+    }
+  }
+  return(expression_matched_sets)
+}
+
+```
+
+
+# nTreg FYC data analysis
+
+## Data import and DESeq2 analysis
+
+Read in raw count data
+
+Excluding known artefacts of L1/L2 deletion. All mice are female, so exclusion of Y/Xist unnecessary
+
+```{r}
+read.delim("nTreg_FYC_raw_counts_Seqmonk.txt") %>%
+  RNA_seqmonk_to_corrected_counts(silent = T, XYexclude = "none", Zfp36exclude = c("Zfp36l1", "Zfp36l2")) -> nTreg_FYC_raw_counts
+```
+
+```{r}
+nTreg_FYC_coldata <- data.frame(row.names = colnames(nTreg_FYC_raw_counts), Genotype = factor(grepl("^RV", colnames(nTreg_FYC_raw_counts)), levels = c(T,F), labels = c("Ctrl", "KO")))
+
+nTreg_FYC_raw_counts %>%
+  DESeqDataSetFromMatrix(nTreg_FYC_coldata, ~Genotype) %>%
+  DESeq() -> nTreg_FYC_dds
+```
+
+
+## Validation of KO
+
+Counts generated specifically over loxp-flanked regions to assess KO
+
+```{r}
+read_tsv("nTreg_FYC_loxp_raw_counts.txt") %>%
+  rename(Gene = Probe) %>%
+  select(Gene, matches("bam$")) %>%
+  mutate(Gene = paste0(Gene, "_loxP")) -> nTreg_FYC_loxP_raw_counts
+```
+
+```{r}
+summary(colnames(select(nTreg_FYC_loxP_raw_counts, -Gene)) == colnames(nTreg_FYC_raw_counts))
+
+```
+
+```{r}
+nTreg_FYC_loxP_raw_counts %>%
+  column_to_rownames("Gene") %>%
+  t() %>%
+  as.data.frame() -> nTreg_FYC_loxP_raw_counts
+
+(nTreg_FYC_loxP_raw_counts/sizeFactors(nTreg_FYC_dds)) %>%
+  as_tibble(rownames = "Sample") -> nTreg_FYC_loxP_norm_counts
+```
+
+### Figure S3e - KO validation
+
+(also replotted in GraphPad)
+
+```{r fig.height=2.5, fig.width=4.5}
+nTreg_FYC_loxP_norm_counts %>%
+  select(-Zfp36_loxP) %>% 
+  pivot_longer(-Sample, names_to = "Gene", values_to = "Normalised_counts") %>%
+  mutate(Genotype = if_else(grepl("RV", Sample), "Ctrl", "dKO")) %>%
+  mutate(Gene = sub("_loxP", "", Gene)) %>%
+  ggplot(aes(x = Gene, y = Normalised_counts, fill = Genotype, shape = Genotype)) +
+    stat_summary(geom = "bar", fun = mean, position = "dodge", colour = "black") +
+    geom_point(position = position_jitterdodge(dodge.width = 0.9, jitter.width = 0.25)) +
+    facet_wrap(~ Gene, scales = "free") +
+    theme_bw() +
+    scale_fill_manual(values = c("grey", "white")) +
+    scale_shape_manual(values = c(15,0)) +
+    labs(x = NULL, y = "Normalised read count") +
+    scale_y_continuous(expand = expansion(mult = c(0,0.05))) +
+    theme(panel.background = element_blank(), panel.grid = element_blank(), plot.background = element_blank(), legend.background = element_blank(), legend.key = element_blank())
+#ggsave("Figure_panels_Aug2023/Zfp36l1l2_loxP.svg")
+```
+
+```{r}
+nTreg_FYC_loxP_norm_counts %>%
+  mutate(Genotype = sub("_[0-9]+_Naive.*", "", Sample)) %>%
+  pivot_longer(starts_with("Zfp"), names_to = "Gene", values_to = "norm_counts") %>%
+  filter(Gene != "Zfp36_loxP") %>%
+  group_by(Gene) %>%
+  t_test(norm_counts ~ Genotype) %>%
+  mutate(padj = p.adjust(p, method = "fdr"))
+
+```
+## DE genes
+
+
+```{r}
+lfcShrink(nTreg_FYC_dds, coef = 2, type = "normal") %>%
+  as_tibble(rownames = "Gene") -> res_nTreg_FYC
+```
+
+Extract normalised read counts; export for plotting in GraphPad
+
+```{r}
+counts(nTreg_FYC_dds, normalized = T) %>%
+  as_tibble(rownames = "Gene") -> nTreg_FYC_norm_counts
+nTreg_FYC_norm_counts %>%
+  write_tsv("nTreg_FYC_norm_counts.txt")
+```
+
+
+Also export ranked list for GSEA analysis - ranking based on log10(pvalue), sign dependent on L2FC
+
+```{r}
+res_nTreg_FYC %>%
+  filter(!is.na(padj)) %>%
+  mutate(signed_pval = if_else(
+    log2FoldChange > 0,
+    -log10(pvalue),
+    log10(pvalue)
+  )) %>%
+  mutate(signed_pval = if_else(
+    signed_pval == -Inf, 
+    min(signed_pval[!signed_pval == -Inf])-1,
+    signed_pval
+  )) %>%
+  select(Gene, signed_pval) -> nTreg_FYC_signedP
+
+nTreg_FYC_signedP %>%
+  write_tsv("Files_for_GSEA/nTreg_FYC_ranked.rnk")
+```
+
+
+### Figure 2b - MA plot
+
+```{r fig.height=3, fig.width=5}
+res_nTreg_FYC %>% 
+  filter(!is.na(padj)) %>%
+  arrange(Gene %in% c("Foxp3", "Ctla4", "Ikzf2", "Icos", "Tgfb1", "Lrrc32"), desc(padj)) %>%
+  ggplot(aes(x = baseMean, y = log2FoldChange)) +
+    geom_point(aes(colour = padj < 0.05)) +
+    geom_point(data = filter(res_nTreg_FYC, Gene %in% c("Foxp3", "Ctla4", "Ikzf2", "Icos", "Tgfb1", "Lrrc32")), shape = 1, colour = "black") +
+    geom_text_repel(data = filter(res_nTreg_FYC, Gene %in% c("Foxp3", "Ctla4", "Ikzf2", "Icos", "Tgfb1", "Lrrc32")), aes(label = Gene), min.segment.length = 0, max.overlaps = 20) +
+    scale_x_log10() +
+    scale_colour_manual(values = c("grey60", "dodgerblue3"))
+#ggsave("Figure_panels_Aug2023/MA_plot_selected_genes.svg")
+```
+
+
+## Define groups of genes of interest
+
+### CLIP targets
+
+See Matheson et al (https://doi.org/10.1038/s41598-022-24132-6) for designation of targets
+
+Union of targets is available in manuscript supplementary table S3
+
+```{r}
+CD4_iCLIP_3UTR_targets <- deframe(read_tsv("../../CD4_activation/Final_analysis/CD4_iCLIP_3UTR_hits.txt", col_names = F))
+Darnell_HITSCLIP_4h_3UTR_targets <- deframe(read_tsv("../../CD4_activation/Final_analysis/Darnell_4h_3UTR_hits.txt", col_names = F))
+Darnell_HITSCLIP_72h_3UTR_targets <- deframe(read_tsv("../../CD4_activation/Final_analysis/Darnell_72h_3UTR_hits.txt", col_names = F))
+
+All_CD4_CLIP_3UTR_targets <- unique(c(CD4_iCLIP_3UTR_targets, Darnell_HITSCLIP_4h_3UTR_targets, Darnell_HITSCLIP_72h_3UTR_targets))
+
+All_CD4_CLIP_3UTR_targets %>% write("All_CLIP_targets_3UTR.txt") # Table S3
+```
+
+### AU-rich elements
+
+```{r}
+import("../../Annotations/Mus_musculus.GRCm38.90.gtf.gz") %>%
+  as_tibble() -> gtf_GRCm38
+```
+
+```{r}
+gtf_GRCm38 %>% 
+  mutate(seqnames = paste0("chr", sub("MT", "M", seqnames))) %>%
+  as_tibble() %>%
+  filter(gene_name %in% res_nTreg_FYC$Gene) %>% 
+  filter(!grepl("chr[JG]", seqnames)) %>% 
+  filter(type == "three_prime_utr") %>%
+  filter(transcript_biotype == "protein_coding") %>%
+  group_by(transcript_id) %>%
+  mutate(seq = getSeq(BSgenome.Mmusculus.UCSC.mm10, seqnames, start, end, strand = strand, as.character = T)) %>%
+  arrange(start) %>%
+  group_by(gene_name, transcript_id) %>%
+  summarise(seq = if_else(strand[1] == "+", paste(seq, collapse = ""), paste(rev(seq), collapse = "")), nExons = n(), .groups = "drop") %>%
+  mutate(ARE = grepl("TATT[ATGC]{0,3}TATT", seq)) %>%
+  filter(ARE == T) %>%
+  distinct(gene_name) %>%
+  pull(gene_name) -> all_genes_with_ARE
+```
+
+
+### Treg signature
+
+The Treg signature is defined in Hill/Benoist et al, 2007, Immunity (https://www.sciencedirect.com/science/article/pii/S107476130700492X) - table S1 shows both over- and under-represented genes in Tregs vs Tconv, we want the overrepresented genes (FC > 1 - since this is already only those they define as altered this should equate to all >= 1.5). 
+
+```{r}
+read_tsv("Treg_signature_S1.txt") %>%
+  rename_all(function(x) gsub(" " , "_", x)) %>%
+  filter(TregSig > 1) %>%
+  filter(!Gene_Symbol == "---") %>% 
+  separate(Gene_Symbol, "Gene", sep= " /// ", remove = F) %>% 
+  distinct(Gene, .keep_all = T) ->
+    Treg_signature_genes
+
+```
+
+Excluded any probes from the array for which they don't provide a gene symbol, and deduplicated. There are also a number for which there seem to be options for the gene symbol, eg:
+
+Dnahc12 /// Dnahc7b /// LOC433299
+
+For these, picked the first gene symbol listed
+
+
+
+```{r}
+Treg_signature_genes %>%
+  filter(!Gene %in% GRCm38_v90_nomenclature$Gene_name)
+```
+
+There are 67 genes for which the gene name does not appear in the annotations that I have used for analysis. Went through these and replaced the listed gene name with the corresponding name for my annotation (based on NCBI reference, or searching for the gene name in Ensembl which will often find synonyms, and checking the coordinates). For a few, no current corresponding annotation was found so these were excluded. 
+
+```{r}
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Dnahc12"] <- "Dnah12"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "4631408O11Rik"] <- "Itih5"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "AI790276"] <- NA
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Zfpn1a4"] <- "Ikzf4"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "LOC544988"] <- "2610042L04Rik"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "A730095J18Rik"] <- "Ikzf2"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Zfpn1a2"] <- "Ikzf2"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "8430427H17Rik"] <- "Nol4l"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Ccdc109b"] <- "Mcub"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "6430570G24"] <- "Ypel2"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Folr4"] <- "Izumo1r"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "5830456J23Rik"] <- NA
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "4921524J06Rik"] <- "Ston1"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Niban"] <- "Fam129a"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Bhlhb2"] <- "Bhlhe40"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Ndg2"] <- "Chchd10"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "9630010G10Rik"] <- NA
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Gbp1"] <- "Gbp2b"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Gpr177"] <- "Wls"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Phlpp"] <- "Phlpp1"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "1200007D18Rik"] <- "Ergic1"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "LOC637870"] <- "Pmepa1"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "C80638"] <- "Slc9b2"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "C230081A13Rik"] <- "Peak1"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "1810054D07Rik"] <- "Ttc39b"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "LOC630539"] <- NA
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Penk1"] <- "Penk"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Ga17"] <- "Kcnq5"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "2510042P03Rik"] <- "Ttc30b"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "4631427C17Rik"] <- "Ahcyl2"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Lycat"] <- "Lclat1"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "6330509M05Rik"] <- NA
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Csda"] <- "Ybx3"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "4930566A11Rik"] <- "Zfp821"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "4833442J19Rik"] <- "Etfbkmt"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Rab6ip1"] <- "Dennd5a"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Ndrl"] <- "Ndrg1"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "A530052I06Rik"] <- "Slc22a15"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "C030046G05"] <- NA
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "2510005D08Rik"] <- "Eef1akmt1"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "1300007C21Rik"] <- NA
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Snag1"] <- "Snx18"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "AI875142"] <- "Prkca"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "AI843639"] <- "March3"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "2810402A17Rik"] <- "Slc25a53"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "AI448196"] <- "Armcx4"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Zfpn1a3"] <- "Ikzf3"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "D18Ertd653e"] <- "Ldlrad4"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "BC053440"] <- "Naf1"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "D10Ucla1"] <- "Reep3"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "LOC434197"] <- "Fam169b"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "A530088I07Rik"] <- "Gsap"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Spin2"] <- "Spin2c"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "AI480653"] <- "Xxylt1"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Ibrdc3"] <- "Rnf19b"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "5830474E16Rik"] <- NA
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Pscd3"] <- "Cyth3"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "2810051F02Rik"] <- "Airn"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "4732460K03Rik"] <- "Zfp862-ps"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "2610027H17Rik"] <- NA
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Hnrpll"] <- "Hnrnpll"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Crsp9"] <- "Med7"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Mlstd2"] <- "Far1"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "3110045G13Rik"] <- "Pear1"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Birc1e"] <- "Naip5"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "1700108L22Rik"] <- "Larp1b"
+Treg_signature_genes$Gene[Treg_signature_genes$Gene == "Hdgfrp3"] <- "Hdgfl3"
+
+Treg_signature_genes %>%
+  filter(!is.na(Gene)) %>%
+  distinct(Gene) -> Treg_signature_genes
+
+summary(Treg_signature_genes$Gene %in% GRCm38_v90_nomenclature$Gene_name)
+```
+
+
+```{r}
+Treg_signature_genes %>%
+  filter(Gene %in% rownames(nTreg_FYC_raw_counts)) -> Treg_signature_genes # there are a couple of genes in the annotation that don't appear in seqmonk output
+Treg_signature_genes %>%
+  pull(Gene) %>%
+  write("Treg_signature_gene_names_final.txt")
+```
+
+
+## CLIP/ARE vs expression changes
+
+```{r}
+res_nTreg_FYC %>%
+  mutate(Treg_signature = Gene %in% Treg_signature_genes$Gene) %>%
+  mutate(All_CLIP_3UTR = Gene %in% All_CD4_CLIP_3UTR_targets) %>%
+  mutate(ARE = Gene %in% all_genes_with_ARE) -> res_nTreg_FYC
+```
+
+### Table S1-2 - increased/decreased genes
+
+```{r}
+res_nTreg_FYC %>%
+  filter(padj < 0.05) %>%
+  arrange(padj) %>%
+  group_by(log2FoldChange > 0) %>%
+  group_split() %>%
+  map2(list("_decreased.txt", "_increased.txt"), ~ {
+    .x %>%
+      write_tsv(paste0("Supplementary_tables/DE_genes_nTreg_FYC", .y))
+  })
+```
+
+
+How many altered genes are CLIP targets?
+
+```{r}
+res_nTreg_FYC %>%
+  filter(padj < 0.05) %>%
+  group_by(All_CLIP_3UTR, log2FoldChange > 0) %>%
+  count()
+```
+
+
+### Figure S4 - number of increased/decreased genes in CLIP/ARE categories
+
+```{r fig.height=3.5, fig.width=4}
+res_nTreg_FYC %>%
+  filter(padj < 0.05) %>%
+  mutate(Expression_change = if_else(log2FoldChange > 0, "Increased", "Decreased")) %>%
+  mutate(CLIP_ARE = case_when(
+    All_CLIP_3UTR == T & ARE == T ~ "CLIP_ARE",
+    All_CLIP_3UTR == T ~ "CLIP",
+    ARE == T ~ "ARE",
+    TRUE ~ "Neither"
+  )) %>%
+  mutate(CLIP_ARE = factor(CLIP_ARE, levels = c("Neither", "ARE", "CLIP", "CLIP_ARE"))) %>%
+  ggplot(aes(x = Expression_change, fill = CLIP_ARE)) +
+    geom_bar(colour = "black") +
+    ggtitle("nTreg FYC") +
+    ylab("Number of genes")+
+    scale_fill_manual(values = c("white", "mediumseagreen", "darkorange1", "navy"))
+
+res_nTreg_FYC %>%
+  filter(padj < 0.05) %>%
+  mutate(Expression_change = if_else(log2FoldChange > 0, "Increased", "Decreased")) %>%
+  mutate(CLIP_ARE = case_when(
+    All_CLIP_3UTR == T & ARE == T ~ "CLIP_ARE",
+    All_CLIP_3UTR == T ~ "CLIP",
+    ARE == T ~ "ARE",
+    TRUE ~ "Neither"
+  )) %>%
+  mutate(CLIP_ARE = factor(CLIP_ARE, levels = c("Neither", "ARE", "CLIP", "CLIP_ARE"))) %>%
+  ggplot(aes(x = Expression_change, fill = CLIP_ARE)) +
+    geom_bar(position = "fill", colour = "black") +
+    ggtitle("nTreg FYC") +
+    ylab("Proportion of genes")+
+    scale_fill_manual(values = c("white", "mediumseagreen", "darkorange1", "navy"))
+#ggsave("Figure_panels_Aug2023/CLIP_ARE_barplot.svg")
+```
+
+### Figure 2c - CLIP/ARE vs L2FC
+
+Only considering genes that have reasonable expression level (since L2FC )
+
+```{r fig.height=3.5, fig.width=4.2}
+res_nTreg_FYC %>%
+  filter(baseMean > 100) %>% 
+  filter(!is.na(padj)) %>%
+  mutate(CLIP_ARE = case_when(
+    All_CLIP_3UTR == T & ARE == T ~ "CLIP_ARE",
+    All_CLIP_3UTR == T ~ "CLIP",
+    ARE == T ~ "ARE",
+    TRUE ~ "Neither"
+  )) %>%
+  mutate(CLIP_ARE = factor(CLIP_ARE, levels = c("Neither", "ARE", "CLIP", "CLIP_ARE"))) %>%
+  ggplot(aes(x = CLIP_ARE, y = log2FoldChange, fill = CLIP_ARE)) +
+    geom_violin() +
+    geom_boxplot(outlier.size = 0.2, fill = "grey20", colour = "black", width=0.1, size = 0.3) +
+    ggtitle("nTreg FYC") +
+    ylab("Log2 fold change (KO vs control)")+
+    scale_fill_manual(values = c("grey60", "mediumseagreen", "darkorange1", "navy")) +
+    coord_cartesian(ylim = c(-2,2)) + 
+    geom_hline(yintercept = 0, colour = "grey10", linetype = "dashed") +
+    theme(legend.position = "none", axis.title.x = element_blank())
+#ggsave("Figure_panels_Aug2023/CLIP_ARE_violin.svg")
+
+res_nTreg_FYC %>%
+  filter(baseMean > 100) %>% 
+  filter(!is.na(padj)) %>%
+  mutate(CLIP_ARE = case_when(
+    All_CLIP_3UTR == T & ARE == T ~ "CLIP_ARE",
+    All_CLIP_3UTR == T ~ "CLIP",
+    ARE == T ~ "ARE",
+    TRUE ~ "Neither"
+  )) %>%
+  mutate(CLIP_ARE = factor(CLIP_ARE, levels = c("Neither", "ARE", "CLIP", "CLIP_ARE"))) %>%
+  tukey_hsd(log2FoldChange ~ CLIP_ARE)
+
+```
+
+Number of genes in each group:
+
+```{r}
+res_nTreg_FYC %>%
+  filter(baseMean > 100) %>% 
+  filter(!is.na(padj)) %>%
+  group_by(All_CLIP_3UTR, ARE) %>%
+  count()
+```
+
+
+## GSEA analyses
+
+Complete list of gene sets available in manscript supplementary tables
+
+```{r}
+read_tsv("Files_for_GSEA/Final_genesets_for_GSEA.gmx") %>%
+  slice(-1) %>%
+  rename_with(~ gsub("[ -]", "_", .x)) -> updated_genesets_aug2023
+```
+```{r}
+list.files("GSEA_nTreg_FYC_final_genesets", "gsea.*tsv", full.names = T) %>%
+  map(~ {
+    read_tsv(.x) %>%
+      rename_with(~ gsub("[- ]", "_", .x)) %>%
+      arrange(FDR_q_val) %>%
+      dplyr::slice(1:10)
+  }) %>%
+  bind_rows() %>%
+  select(NAME, SIZE, NES, FDR_q_val, RANK_AT_MAX) %>%
+  mutate(LE_genes = map(NAME, ~ {
+    read_tsv(paste0("GSEA_nTreg_FYC_final_genesets/", .x, ".tsv")) %>%
+      filter(`CORE ENRICHMENT` == "Yes") %>%
+      pull(SYMBOL)
+  })) %>%
+  mutate(nGenes_LE = unlist(map(LE_genes, length))) %>%
+  mutate(nCLIP_LE = unlist(map(LE_genes, ~ sum(.x %in% All_CD4_CLIP_3UTR_targets)))) %>%
+  arrange(NES) %>%
+  mutate(NAME = factor(NAME, levels= unique(NAME))) -> GSEA_nTreg_FYC_final_top10
+```
+
+
+### Figure 2d - GSEA overview
+
+```{r fig.height=4.5, fig.width=8.5}
+GSEA_nTreg_FYC_final_top10 %>%
+  mutate(NAME = paste0(NAME, " (", SIZE, ")")) %>%
+  mutate(NAME = factor(NAME, levels = unique(NAME))) %>% 
+  mutate(LE_genes = map(LE_genes, as_tibble_col, "Gene")) %>%
+  unnest(LE_genes) %>%
+  mutate(CLIP_ARE = case_when(
+    Gene %in% All_CD4_CLIP_3UTR_targets & Gene %in% all_genes_with_ARE ~ "CLIP_ARE",
+    Gene %in% All_CD4_CLIP_3UTR_targets ~ "CLIP",
+    Gene %in% all_genes_with_ARE ~ "ARE",
+    TRUE ~ "Neither"
+  )) %>%
+  mutate(CLIP_ARE = factor(CLIP_ARE, levels = c("Neither", "ARE", "CLIP", "CLIP_ARE"))) -> GSEA_nTreg_FYC_top10_genes
+
+GSEA_nTreg_FYC_final_top10 %>%
+  mutate(NAME = paste0(NAME, " (", SIZE, ")")) %>%
+  mutate(NAME = factor(NAME, levels = unique(NAME))) %>% 
+  mutate(pval_lab = if_else(FDR_q_val == 0, "< 0.001", as.character(round(FDR_q_val, digits = 3)))) %>%
+  ggplot(aes(NAME)) +
+    geom_bar(data = GSEA_nTreg_FYC_top10_genes, aes(fill = CLIP_ARE)) +
+    coord_flip() +
+    scale_fill_manual(values = c("grey60", "mediumseagreen", "darkorange1", "navy")) +
+    ggnewscale::new_scale_fill() +
+    geom_rect(aes(xmin = as.numeric(NAME)-0.45, xmax = as.numeric(NAME)+0.45, ymin = -11, ymax = -1, fill = NES), colour = "grey40") +
+    scale_fill_gradientn(colours = rev(brewer.pal(9, "RdBu")), limits = c(-2.2, 2.2)) +
+    geom_text(aes(y = -6, label = pval_lab), colour = "white", size = 3, fontface = "bold") +
+    labs(x = NULL, y = "Number of genes in leading edge") +
+    scale_y_continuous(expand = c(0,0.01)) +
+    theme(axis.line.y = element_blank(), axis.ticks.y = element_blank())
+#ggsave("Figure_panels_Aug2023/GSEA_top10_withARE.svg")
+```
+
+### Table S5 - global GSEA results
+
+
+```{r message=F}
+list.files("GSEA_nTreg_FYC_final_genesets", "gsea.*tsv", full.names = T) %>%
+  map(~ {
+    read_tsv(.x) %>%
+      rename_with(~ gsub("[- ]", "_", .x))
+  }) %>%
+  bind_rows() %>%
+  select(-starts_with("GS"), -12) %>%
+  mutate(LE_genes = map2(NAME, NES, ~ {
+    getGSEAdata("GSEA_nTreg_FYC_final_genesets", .x) -> gseaData
+    gseaData$gsea.rnk$rank <- 0:(nrow(gseaData$gsea.rnk)-1)
+    if(.y > 0) {
+      LE_hits <- gseaData$enrichment_df$hit_indices[gseaData$enrichment_df$eliminate == 0 & gseaData$enrichment_df$hit_indices <= gseaData$enrichment_df$hit_indices[gseaData$enrichment_df$es_profile == max(gseaData$enrichment_df$es_profile)]]
+    } else {
+      LE_hits <- gseaData$enrichment_df$hit_indices[gseaData$enrichment_df$eliminate == 0 & gseaData$enrichment_df$hit_indices >= gseaData$enrichment_df$hit_indices[gseaData$enrichment_df$es_profile == min(gseaData$enrichment_df$es_profile)]]
+    }
+    return(gseaData$gsea.rnk$mgi.symbol[gseaData$gsea.rnk$rank %in% LE_hits])
+  })) %>%
+  mutate(nGenes_LE = unlist(map(LE_genes, length))) %>%
+  mutate(CLIP_LE_genes = map(LE_genes, ~ intersect(.x, All_CD4_CLIP_3UTR_targets))) %>%
+  mutate(nCLIP_LE = unlist(map(CLIP_LE_genes, length))) %>%
+  mutate(CLIP_LE_genes = unlist(map(CLIP_LE_genes, ~ paste(.x, collapse = ";")))) %>%
+  mutate(ARE_LE_genes = map(LE_genes, ~ intersect(.x, all_genes_with_ARE))) %>%
+  mutate(nARE_LE = unlist(map(ARE_LE_genes, length))) %>%
+  mutate(ARE_LE_genes = unlist(map(ARE_LE_genes, ~ paste(.x, collapse = ";")))) %>%
+  arrange(desc(NES)) %>%
+  select(-LE_genes) %>%
+  write_tsv("Supplementary_tables/GSEA_global.txt")
+
+
+```
+
+### Figure 2e - GSEA plots for TCR signalling and endocytosis
+
+```{r fig.height=3.5, fig.width=6}
+GSEA_plot_single("GSEA_nTreg_FYC_final_genesets", "TCR SIGNALLING", colour = "black", withCLIPARE = T, CLIPAREcol = rep("darkorange1", 3))
+#ggsave("Figure_panels_Aug2023/GSEA_TCR_withARE.svg")
+```
+
+```{r fig.height=3.5, fig.width=6}
+GSEA_plot_single("GSEA_nTreg_FYC_final_genesets", "ENDOCYTOSIS", colour = "black", withCLIPARE = T, CLIPAREcol = rep("darkorange1", 3))
+#ggsave("Figure_panels_Aug2023/GSEA_endocytosis_withARE.svg")
+```
+
+### Figure 2f - GSEA plots for IL2/IL7-responsive genes
+
+```{r fig.height=4.3, fig.width=7}
+GSEA_plot_multi("GSEA_nTreg_FYC_final_genesets", c("INCREASED IN IL-2", "DECREASED IN IL-2"), colours = c("firebrick4", "royalblue4"), leadingEdge = T)
+#ggsave("Figure_panels_Aug2023/GSEA_IL2.svg")
+
+GSEA_plot_multi("GSEA_nTreg_FYC_final_genesets", c("INCREASED IN IL-7", "DECREASED IN IL-7"), colours = c("firebrick4", "royalblue4"), leadingEdge = T)
+#ggsave("Figure_panels_Aug2023/GSEA_IL7.svg")
+
+```
+
+### Figure 2g - GSEA plot for IFNg-responsive genes
+
+```{r fig.height=4.3, fig.width=7.35}
+GSEA_plot_multi("GSEA_nTreg_FYC_final_genesets", c("INCREASED IN IFNG", "DECREASED IN IFNG"), colours = c("firebrick4", "royalblue4"), leadingEdge = T)
+#ggsave("Figure_panels_Aug2023/GSEA_IFNg_iTreg.svg")
+```
+
+
+
+## Heatmaps
+
+### Figure S5a - TCR heatmap
+
+Showing top 15 increased genes
+
+```{r fig.height=4, fig.width=5.5}
+nTreg_FYC_norm_counts %>%
+  filter(Gene %in% updated_genesets_aug2023$TCR_signalling) %>%
+  left_join(res_nTreg_FYC) %>% 
+  arrange(padj) %>%
+  filter(log2FoldChange > 0) %>%
+  dplyr::slice(1:15) %>%
+  mutate(CLIP_ARE = factor(case_when(
+    Gene %in% All_CD4_CLIP_3UTR_targets & Gene %in% all_genes_with_ARE ~ "CLIP target + ARE",
+    Gene %in% All_CD4_CLIP_3UTR_targets ~ "CLIP target",
+    Gene %in% all_genes_with_ARE ~ "ARE",
+    TRUE ~ "Neither"
+  ), levels = c("Neither", "CLIP target", "ARE", "CLIP target + ARE"))) -> TCR_top15_ARE
+
+#svg("Figure_panels_Aug2023/TCR_hm_top15_ARE.svg", height = 4, width = 5.5)
+TCR_top15_ARE %>%
+  column_to_rownames("Gene") %>%
+  select(ends_with("bam")) %>%
+  rename_with(~ sub("_Naive.*", "", .x)) %>%
+  mutate(across(everything(), log2)) %>%
+  mutate(mean_log2 = rowMeans(.)) %>%
+  mutate(across(-starts_with("mean"), ~ .x-mean_log2)) %>%
+  select(-mean_log2) %>% 
+  pheatmap(
+    cluster_rows = F,
+    cluster_cols = F,
+    annotation_row = { select(TCR_top15_ARE, Gene, CLIP_ARE) %>% column_to_rownames("Gene") },
+    annotation_colors = list(CLIP_ARE = c("ARE" = "mediumseagreen", "CLIP target" = "darkorange1", "CLIP target + ARE" = "navy", "Neither" = "white")),
+    breaks = seq(-1.3,1.3, length.out = 101)
+  )
+#dev.off()
+```
+
+### Figure S10 - Endocytosis
+
+Showing all genes in the leading edge from the GSEA
+
+```{r}
+nTreg_FYC_norm_counts %>%
+  filter(Gene %in% { GSEA_nTreg_FYC_top10_genes %>% filter(grepl("ENDOCYTOSIS", NAME)) %>% distinct(Gene) %>% pull() }) %>%
+  filter(rowMeans(select(., where(is.numeric))) > 100) %>%
+  mutate(CLIP_ARE = factor(case_when(
+    Gene %in% All_CD4_CLIP_3UTR_targets & Gene %in% all_genes_with_ARE ~ "CLIP target + ARE",
+    Gene %in% All_CD4_CLIP_3UTR_targets ~ "CLIP target",
+    Gene %in% all_genes_with_ARE ~ "ARE",
+    TRUE ~ "Neither"
+  ), levels = c("Neither", "ARE", "CLIP target", "CLIP target + ARE"))) -> Endocytosis_LE_counts
+```
+
+Which are excluded based on expression?
+
+```{r}
+nTreg_FYC_norm_counts %>%
+  filter(Gene %in%  { GSEA_nTreg_FYC_top10_genes %>% filter(grepl("ENDOCYTOSIS", NAME)) %>% distinct(Gene) %>% pull() }) %>%
+  filter(rowMeans(select(., where(is.numeric))) <= 100)
+```
+
+```{r}
+Endocytosis_LE_counts %>%
+  left_join(res_nTreg_FYC) %>% 
+  arrange(padj) %>%
+  mutate(log2_expression = log2(baseMean)) -> Endocytosis_LE_counts
+```
+
+
+```{r fig.height=8.5, fig.width=5.5}
+#svg("Figure_panels_Aug2023/Endocytosis_LE_hm.svg", height = 8.5, width = 5.5)
+Endocytosis_LE_counts %>%
+  column_to_rownames("Gene") %>%
+  select(ends_with("bam")) %>%
+  rename_with(~ sub("_Naive.*", "", .x)) %>%
+  mutate(across(everything(), ~log2(.x+1))) %>%
+  mutate(mean_log2 = rowMeans(.)) %>%
+  mutate(across(-starts_with("mean"), ~ .x-mean_log2)) %>%
+  select(-mean_log2) %>%
+  pheatmap(
+    cluster_rows = F,
+    cluster_cols = F,
+    annotation_row = { select(Endocytosis_LE_counts, Gene, CLIP_ARE) %>% column_to_rownames("Gene") },
+    annotation_colors = list(CLIP_ARE = c("ARE" = "mediumseagreen", "CLIP target" = "darkorange1", "CLIP target + ARE" = "navy", "Neither" = "white")),
+    breaks = seq(-2,2, length.out = 101),
+    fontsize_row = 8.5
+  )
+#dev.off()
+```
+
+## Identification of transcription factors bound to endocytosis gene promoters
+
+```{r}
+GSEA_nTreg_FYC_top10_genes %>%
+  filter(grepl("ENDOCYTOSIS", NAME)) %>%
+  distinct(Gene) %>%
+  left_join(GRCm38_v90_nomenclature, by = c(Gene = "Gene_name")) %>%
+  mutate(
+    promoter_start = if_else(Probe.Strand == "+", Start - 500, End - 500),
+    promoter_end = if_else(Probe.Strand == "+", Start + 500, End + 500)
+  ) %>%
+  mutate(Chromosome = paste0("chr", sub("MT","M", Chromosome))) %>%
+  select(Chromosome, promoter_start, promoter_end, Gene) %>%
+  rename(start = promoter_start, end = promoter_end) -> endocytosis_promoters
+endocytosis_promoters %>%
+  write_tsv("endocytosis_LE_promoters.bed", col_names = F)
+```
+
+```{r}
+ExpressionMatch_multi(nSets = 5, countData = log2(nTreg_FYC_raw_counts+1), resData = log2(nTreg_FYC_raw_counts+1), geneSets = list({
+    GSEA_nTreg_FYC_top10_genes %>%
+    filter(grepl("ENDOCYTOSIS", NAME)) %>%
+    distinct(Gene) %>% pull(Gene) }), 
+    baseMeanGrep = "RV", geneSetNames = "Endocytosis_LE", nRandom = 100) -> exMatch_controls_endocytosis_LE
+```
+
+Unfortunately seed was not set. Control gene lists generated in this way that were used for the manuscript are available in github repository:
+```readRDS("endocytosis_exMatch_genes_from_ms.Rds") -> exMatch_controls_endocytosis_LE```
+
+
+```{r}
+exMatch_controls_endocytosis_LE %>%
+  map( ~ {
+    .x %>%
+      unlist() %>%
+      as_tibble_col("Gene") %>%
+      left_join(GRCm38_v90_nomenclature, by = c(Gene = "Gene_name")) %>%
+      mutate(
+        promoter_start = if_else(Probe.Strand == "+", Start - 500, End - 500),
+        promoter_end = if_else(Probe.Strand == "+", Start + 500, End + 500)
+      ) %>%
+      mutate(Chromosome = paste0("chr", sub("MT","M", Chromosome))) %>%
+      select(Chromosome, promoter_start, promoter_end, Gene) %>%
+      rename(start = promoter_start, end = promoter_end) 
+  }) -> exMatch_controls_endocytosis_promoters
+
+exMatch_controls_endocytosis_promoters %>%
+  map2(names(exMatch_controls_endocytosis_LE), ~ .x %>% write_tsv(paste0("endocytosis_LE_EMcontrol_", .y, ".bed"), col_names = F))
+```
+
+
+Used UCSC table browser to export the appropriate regions from ReMap ChIP track
+
+```{r}
+read_tsv("endocytosis_LE_promoter_ReMap.txt") %>%
+  rename(chrom = "#chrom", end = chromEnd, start = chromStart) %>%
+  mutate(queryHits = row_number()) -> endocytosis_LE_ReMap
+
+endocytosis_LE_ReMap %>%
+  makeGRangesFromDataFrame() %>%
+  findOverlaps(makeGRangesFromDataFrame(endocytosis_promoters)) %>%
+  as_tibble() %>%
+  right_join(endocytosis_LE_ReMap) %>%
+  left_join({endocytosis_promoters %>% mutate(subjectHits = row_number()) %>% select(subjectHits, Gene)}) %>%
+  select(-ends_with("Hits")) -> endocytosis_LE_ReMap
+```
+
+```{r}
+list.files(pattern = "EMcontrol.*ReM") %>%
+  map2(exMatch_controls_endocytosis_promoters, ~ {
+    read_tsv(.x) %>%
+      rename(chrom = "#chrom", end = chromEnd, start = chromStart) %>%
+      mutate(queryHits = row_number()) -> remap_table
+    remap_table %>%
+      makeGRangesFromDataFrame() %>%
+      findOverlaps(makeGRangesFromDataFrame(.y)) %>%
+      as_tibble() %>%
+      right_join(remap_table) %>%
+      left_join({.y %>% mutate(subjectHits = row_number()) %>% select(subjectHits, Gene)}) %>%
+      select(-ends_with("Hits"))
+  }) -> endocytosis_EMcontrol_ReMap
+
+
+
+```
+
+
+```{r}
+endocytosis_LE_ReMap %>%
+  group_by(TF, Gene) %>%
+  summarise(nPeaks = n()) %>%
+  summarise(nGenes = n(), totalPeaks = sum(nPeaks)) %>%
+  arrange(desc(nGenes))
+```
+```{r}
+endocytosis_EMcontrol_ReMap %>%
+  map(~ {
+    .x %>%
+      group_by(TF, Gene) %>%
+      summarise(nPeaks = n()) %>%
+      summarise(nGenes = n(), totalPeaks = sum(nPeaks)) %>%
+      arrange(desc(nGenes))
+  })
+  
+```
+
+```{r}
+endocytosis_EMcontrol_ReMap %>%
+  map(~ {
+    .x %>%
+      group_by(TF, Gene) %>%
+      summarise(nPeaks = n()) %>%
+      summarise(nGenes = n(), totalPeaks = sum(nPeaks))
+  }) %>%
+  bind_rows() %>%
+  add_column(type = "Control") %>%
+  bind_rows(
+    endocytosis_LE_ReMap %>%
+      group_by(TF, Gene) %>%
+      summarise(nPeaks = n()) %>%
+      summarise(nGenes = n(), totalPeaks = sum(nPeaks)) %>%
+      add_column(type = "Endocytosis") 
+  ) -> endocytosis_remap_with_controls
+```
+```{r}
+endocytosis_remap_with_controls %>%
+  group_by(TF) %>%
+  arrange(desc(nGenes), type) %>% # if tied for nGenes, controls will be listed before endocytosis gene set, ie endocytosis can only have rank 1 if it's higher than all the controls
+  mutate(gene_rank = row_number()) %>%
+  arrange(desc(totalPeaks), type) %>%
+  mutate(peak_rank = row_number()) %>%
+  ungroup() %>%
+  filter(type == "Endocytosis") %>%
+  filter(nGenes > 5) %>%
+  filter(gene_rank == 1 | peak_rank == 1 | nGenes >= 15) -> endocytosis_highly_used_tf
+```
+
+
+### Figure S12a - heatmap for TF regulating endocytosis
+
+```{r}
+nTreg_FYC_norm_counts %>%
+  filter(toupper(Gene) %in% endocytosis_highly_used_tf$TF) %>%
+  filter(rowMeans(select(., where(is.numeric))) > 100) %>%
+  mutate(CLIP_ARE = factor(case_when(
+    Gene %in% All_CD4_CLIP_3UTR_targets & Gene %in% all_genes_with_ARE ~ "CLIP target + ARE",
+    Gene %in% All_CD4_CLIP_3UTR_targets ~ "CLIP target",
+    Gene %in% all_genes_with_ARE ~ "ARE",
+    TRUE ~ "Neither"
+  ), levels = c("Neither", "CLIP target", "ARE", "CLIP target + ARE"))) -> endo_tf_counts
+```
+
+
+Which are excluded based on expression?
+
+```{r}
+nTreg_FYC_norm_counts %>%
+  filter(toupper(Gene) %in% endocytosis_highly_used_tf$TF) %>%
+  filter(rowMeans(select(., where(is.numeric))) <= 100)
+```
+
+
+Which TF aren't found?
+
+```{r}
+endocytosis_highly_used_tf %>% 
+  filter(!TF %in% toupper(nTreg_FYC_norm_counts$Gene))
+```
+
+Most of these are where a single TF name is referring to >1 gene/family of genes
+
+```{r fig.height=10, fig.width=5}
+endo_tf_counts %>%
+  left_join(res_nTreg_FYC) %>% 
+  arrange(padj) %>%
+  mutate(log2_expression = log2(baseMean)) -> endo_tf_counts
+```
+```{r}
+endo_tf_counts %>%
+  slice(1:20) %>% # already ranked by FDR
+  mutate(top_ranked = if_else(toupper(Gene) %in% endocytosis_highly_used_tf$TF[endocytosis_highly_used_tf$gene_rank == 1 | endocytosis_highly_used_tf$peak_rank == 1], "top_rank", "none")) %>%
+  mutate(many_genes = if_else(toupper(Gene) %in% endocytosis_highly_used_tf$TF[endocytosis_highly_used_tf$nGenes >= 15], "many_genes", "none")) %>%
+  mutate(differential_expression = case_when(
+    padj < 0.05 ~ "FDR < 0.05",
+    padj < 0.25 ~ "0.05 <= FDR < 0.25",
+    TRUE ~ "FDR >= 0.25"
+  )) -> endo_tf_lowFDR
+```
+
+```{r fig.height=5, fig.width=8}
+#svg("Figure_panels_Aug2023/Transcription_factor_hm.svg", height = 5, width = 8)
+endo_tf_lowFDR %>%
+  column_to_rownames("Gene") %>%
+  select(ends_with("bam")) %>%
+  rename_with(~ sub("_Naive.*", "", .x)) %>%
+  mutate(across(everything(), log2)) %>%
+  mutate(mean_log2 = rowMeans(.)) %>%
+  mutate(across(-starts_with("mean"), ~ .x-mean_log2)) %>%
+  select(-mean_log2) %>%
+  pheatmap(
+    cluster_cols = F,
+    clustering_distance_rows = "correlation",
+    annotation_row = { select(endo_tf_lowFDR, Gene, CLIP_ARE, differential_expression) %>% column_to_rownames("Gene") },
+    annotation_colors = list(CLIP_ARE = c("ARE" = "mediumseagreen", "CLIP target" = "darkorange1", "CLIP target + ARE" = "navy", "Neither" = "white"), differential_expression = c("FDR < 0.05" = brewer.pal(9, "Purples")[7], "0.05 <= FDR < 0.25" = brewer.pal(9, "Purples")[4], "FDR >= 0.25" = "white")),
+    breaks = seq(-2,2, length.out = 101)
+  )
+#dev.off()
+
+```
+
+## Normalised counts for individual genes
+
+Note that the figures shown in the manuscript were replotted in GraphPad
+
+### Figure S8 - Ctla4
+
+```{r fig.height=2.3, fig.width=3}
+plot_FYC("Ctla4") +
+  scale_shape_manual(values = c(15,0))
+```
+
+
+### Figure 4b - gamma chain cytokine receptors
+
+
+```{r fig.height=4, fig.width=5}
+plot_FYC(c("Il2ra", "Il2rb", "Il2rg", "Il7r")) +
+  scale_shape_manual(values = c(15,0))
+```
+
+
+
+```{r fig.height=2.3, fig.width=3}
+plot_FYC("Ifng") +
+  scale_shape_manual(values = c(15,0))
+```
+
+
+
+
+## GSEA on KEGG pathways (response to reviewers)
+
+```{r}
+read_tsv("GSEA_nTreg_FYC_KEGG_all/gsea_report_for_na_pos_1603909182761.tsv") %>%
+  rename_all(function(x) gsub("[ -]", "_", x)) %>%
+  select(1, 4:10) %>%
+  slice(1:15) -> GSEA_KEGG_top_hits_nTreg_FYC
+
+read_tsv("GSEA_nTreg_FYC_KEGG_all/gsea_report_for_na_neg_1603909182761.tsv") %>%
+  rename_all(function(x) gsub("[ -]", "_", x)) %>%
+  select(1, 4:10) %>%
+  slice(1:15) %>%
+  bind_rows(GSEA_KEGG_top_hits_nTreg_FYC) %>%
+  arrange(NES) -> GSEA_KEGG_top_hits_nTreg_FYC
+```
+
+
+```{r}
+GSEA_KEGG_top_hits_nTreg_FYC %>%
+  unite(Label, NAME, SIZE, sep = " (", remove = F) %>% 
+  mutate(Label = sub("KEGG ", "", gsub("_", " ", Label))) %>%
+  mutate(Label = paste0(Label, ")")) -> GSEA_KEGG_top_hits_nTreg_FYC
+```
+
+
+```{r fig.height=4.5, fig.width=8.5}
+GSEA_KEGG_top_hits_nTreg_FYC %>%
+  mutate(Label = factor(Label, levels = unique(Label))) %>% 
+  mutate(LE_genes = map(NAME, ~ {
+    read_tsv(paste0("GSEA_nTreg_FYC_KEGG_all/", .x, ".tsv")) %>%
+      filter(`CORE ENRICHMENT` == "Yes") %>%
+      pull(SYMBOL)
+  })) %>%
+  mutate(LE_genes = map(LE_genes, as_tibble_col, "Gene")) %>%
+  unnest(LE_genes) %>%
+  mutate(CLIP_ARE = case_when(
+    Gene %in% All_CD4_CLIP_3UTR_targets & Gene %in% all_genes_with_ARE ~ "CLIP_ARE",
+    Gene %in% All_CD4_CLIP_3UTR_targets ~ "CLIP",
+    Gene %in% all_genes_with_ARE ~ "ARE",
+    TRUE ~ "Neither"
+  )) %>%
+  mutate(CLIP_ARE = factor(CLIP_ARE, levels = c("Neither", "ARE", "CLIP", "CLIP_ARE"))) -> GSEA_nTreg_FYC_KEGG_top_genes
+```
+
+```{r fig.height=6, fig.width=10}
+GSEA_KEGG_top_hits_nTreg_FYC %>%
+  mutate(Label = factor(Label, levels = unique(Label))) %>% 
+  mutate(pval_lab = if_else(FDR_q_val == 0, "< 0.001", as.character(round(FDR_q_val, digits = 3)))) %>%
+  ggplot(aes(Label)) +
+    geom_bar(data = GSEA_nTreg_FYC_KEGG_top_genes, aes(fill = CLIP_ARE)) +
+    coord_flip() +
+    scale_fill_manual(values = c("grey60", "mediumseagreen", "darkorange1", "navy")) +
+    ggnewscale::new_scale_fill() +
+    geom_rect(aes(xmin = as.numeric(Label)-0.45, xmax = as.numeric(Label)+0.45, ymin = -11, ymax = -1, fill = NES), colour = "grey40") +
+    scale_fill_gradientn(colours = rev(brewer.pal(9, "RdBu")), limits = c(-2.3, 2.3)) +
+    geom_text(aes(y = -6, label = pval_lab), colour = "white", size = 3, fontface = "bold") +
+    labs(x = NULL, y = "Number of genes in leading edge") +
+    scale_y_continuous(expand = c(0,0.01)) +
+    theme(axis.line.y = element_blank(), axis.ticks.y = element_blank())
+#ggsave("Figure_panels_Aug2023/GSEA_KEGG_withARE.pdf")
+
+```
+
+## Individual genes for response to reviewers
+
+### SOCS family
+
+(also replotted in graphpad)
+
+```{r fig.width=7, fig.height=3}
+plot_FYC(c("Cish", "Socs1", "Socs2", "Socs3", "Socs4", "Socs5", "Socs6", "Socs7")) +
+  scale_shape_manual(values = c(15,0)) + facet_wrap(~Gene, nrow = 2, scales = "free_y")
+#ggsave("Figure_panels_Aug2023/Socs_bulk_RNA.pdf")
+```
+
+### IFNg signature-related 
+
+(also replotted in graphpad)
+
+```{r fig.width=4, fig.height=3}
+plot_FYC(c("Ifng", "Cxcr3", "Gata3", "Rorc")) +
+  scale_shape_manual(values = c(15,0))
+#ggsave("Figure_panels_Aug2023/Th1_bulk_RNA.pdf")
+```
+
+## Comparison of CLIP (reviewers)
+
+```{r}
+list.files("../../iCLIP/CTL_iCLIP_m39/", "D7.*sigxls_anno", full.names = T) %>% # 'D7' appears in WT but not KO file names
+  map(read_tsv) %>%
+  bind_rows() %>%
+  group_by(chromosome, start, end, strand) %>%
+  filter(n() > 1) %>% # same sig site in >1 replicate
+  filter(Feature == "UTR3") %>%
+  ungroup() %>%
+  distinct(Gene_name) %>%
+  pull() -> CTL_iCLIP
+```
+```{r}
+BioVenn::draw.venn(All_CD4_CLIP_3UTR_targets, CTL_iCLIP, NULL,
+                   #output = "pdf", filename = "CD4_vs_CTL_CLIP_venn.pdf",
+                   xtitle = "CD4", ytitle = "CTL", title = "CLIP 3'UTR targets", subtitle = NULL, y_c = "blue")
+```
+
+```{r}
+list.files("../../iCLIP/CTL_iCLIP_m39/", "D7.*scores_anno", full.names = T) %>%
+  map(read_tsv) %>%
+  bind_rows(.id = "replicate") %>%
+  filter(Feature == "UTR3") %>%
+  group_by(Gene_ID, Gene_name, chromosome, start, end, strand, replicate) %>%  
+  summarise(score = max(score), FDR = min(FDR)) %>%
+  summarise(score = sum(score), sigXL = sum(FDR < 0.05) > 1, .groups = "drop") %>%
+  group_by(Gene_ID, Gene_name) %>%
+  summarise(max_score = max(score), sum_score = sum(score), sigXL = sum(sigXL) > 0, .groups = "drop") -> CTL_iCLIP_summary 
+
+```
+```{r}
+list.files("../../icount/Moore Darnell data/GRCm39/", "WT_4h.*scores_anno", full.names = T) %>%
+  map(read_tsv) %>%
+  bind_rows(.id = "replicate") %>%
+  filter(Feature == "UTR3") %>%
+  group_by(Gene_ID, Gene_name, chromosome, start, end, strand, replicate) %>%  
+  summarise(score = max(score), FDR = min(FDR)) %>%
+  summarise(score = sum(score), sigXL = sum(FDR < 0.05) > 1, .groups = "drop") %>%
+  group_by(Gene_ID, Gene_name) %>%
+  summarise(max_score = max(score), sum_score = sum(score), sigXL = sum(sigXL) > 0, .groups = "drop") -> Darnell_4h_CLIP_summary 
+```
+```{r}
+Darnell_4h_CLIP_summary %>%
+  full_join(CTL_iCLIP_summary, by = c("Gene_ID", "Gene_name"), suffix = c("_CD4", "_CTL")) %>%
+  mutate(across(where(is.numeric), ~ if_else(is.na(.x), 0, .x))) %>%
+  mutate(across(where(is.logical), ~ if_else(is.na(.x), F, .x))) -> CLIP_summary_combined
+```
+
+
+```{r fig.height=4, fig.width=5.5}
+CLIP_summary_combined %>%
+  mutate(sig = case_when(
+    sigXL_CD4 == T & sigXL_CTL == T ~ "Both",
+    sigXL_CD4 == T ~ "CD4",
+    sigXL_CTL == T ~ "CTL",
+    TRUE ~ "Neither"
+  )) %>%
+  ggplot(aes(sum_score_CD4, sum_score_CTL)) +
+    geom_point(aes(colour = sig)) +
+    scale_x_log10() +
+    scale_y_log10() +
+    ggpubr::stat_cor()+
+    scale_colour_manual(values = c("mediumpurple", "indianred", "cornflowerblue", "grey"))
+#ggsave("CLIP_correlation_CD4_vs_CTL.pdf")
+
+```
+
+
+## scRNAseq clusters vs nTreg FYC bulk RNA (reviewer response)
+
+```{r}
+read_tsv("../scRNAseq_2022/Treg_combined/cluster_markers_table.txt") %>%
+  rename(Gene = gene) -> scRNAseq_cluster_genes
+
+
+res_nTreg_FYC %>%
+  left_join(filter(scRNAseq_cluster_genes, cluster == 0) %>% select(Gene, avg_log2FC)) %>%
+  rename(cluster0_L2FC = avg_log2FC) %>%
+  left_join(filter(scRNAseq_cluster_genes, cluster == 1) %>% select(Gene, avg_log2FC)) %>%
+  rename(cluster1_L2FC = avg_log2FC) %>%
+  left_join(filter(scRNAseq_cluster_genes, cluster == 2) %>% select(Gene, avg_log2FC)) %>%
+  rename(cluster2_L2FC = avg_log2FC) %>%
+  left_join(filter(scRNAseq_cluster_genes, cluster == 3) %>% select(Gene, avg_log2FC)) %>%
+  rename(cluster3_L2FC = avg_log2FC) %>%
+  left_join(filter(scRNAseq_cluster_genes, cluster == 4) %>% select(Gene, avg_log2FC)) %>%
+  rename(cluster4_L2FC = avg_log2FC) %>%
+  left_join(filter(scRNAseq_cluster_genes, cluster == 5) %>% select(Gene, avg_log2FC)) %>%
+  rename(cluster5_L2FC = avg_log2FC) %>%
+  left_join(filter(scRNAseq_cluster_genes, cluster == 6) %>% select(Gene, avg_log2FC)) %>%
+  rename(cluster6_L2FC = avg_log2FC) %>%
+  left_join(filter(scRNAseq_cluster_genes, cluster == 7) %>% select(Gene, avg_log2FC)) %>%
+  rename(cluster7_L2FC = avg_log2FC) -> res_nTreg_FYC_with_scClusters
+```
+
+```{r fig.height=2.5, fig.width=3}
+read_tsv("GSEA_nTreg_FYC_scRNA_clusters/gsea_report_for_na_neg_1690825162261.tsv") %>%
+  bind_rows(read_tsv("GSEA_nTreg_FYC_scRNA_clusters/gsea_report_for_na_pos_1690825162261.tsv")) %>%
+  rename_with(~ gsub("[ -<>]", "_", .x)) %>%
+  select(NAME, SIZE, NES, FDR_q_val) %>%
+  separate(NAME, c("Cluster", "Change")) %>%
+  filter(Change == "INCREASED") %>%
+  arrange(desc(Cluster)) %>%
+  mutate(Cluster = as.numeric(sub("CLUSTER", "", Cluster))) %>%
+  mutate(Cluster = factor(Cluster, levels = Cluster)) %>%
+  mutate(log10_FDR = if_else(FDR_q_val == 0, -log10(0.001), -log10(FDR_q_val))) %>%
+  ggplot(aes(x = Cluster, y = log10_FDR, fill = NES)) +
+    geom_col(colour = "black") +
+    coord_flip() +
+    scale_fill_gradientn(colours = rev(brewer.pal(9, "RdBu")[c(1,4,5,6,9)]), limits = c(-2.1,2.1)) +
+    scale_alpha_continuous(range = c(0.3,1)) +
+    geom_text(aes(label = SIZE), colour = "black", size = 4, hjust = 0, nudge_y = 0.06) +
+    theme(axis.line = element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_text(size = 11, colour = "black")) +
+    geom_hline(yintercept = 0) +
+    scale_y_continuous(expand = expansion(mult = c(0,0.1))) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed")
+#ggsave("Figure_panels_Aug2023/Bulk_vs_sc_cluster_GSEA_barplot.svg")
+
+```
+
+
+# Cre-ERT2
+
+```{r}
+read.delim("../Cre_ERT2/Raw_counts_ert.txt") -> ertRaw_counts_all
+ertRaw_counts_all %>%
+  RNA_seqmonk_to_corrected_counts(silent = T, XYexclude = "none", Zfp36exclude = c("Zfp36l1", "Zfp36l2")) -> ertRaw_counts_for_DESeq2
+
+read_tsv("../Cre_ERT2/Zfp36_loxP_counts.txt") -> ertZfp36_loxP_counts
+```
+```{r}
+coldata_ert <- data.frame(row.names = colnames(ertRaw_counts_for_DESeq2), Population = sub("^[A-Z]{2}[0-9]_", "", colnames(ertRaw_counts_for_DESeq2)), Genotype = sub("[0-9]_[A-D]", "", colnames(ertRaw_counts_for_DESeq2)))
+
+DESeqDataSetFromMatrix(countData = ertRaw_counts_for_DESeq2, colData = coldata_ert, design = ~Population+Genotype) -> Treg_ERT_all_DESeq
+
+DESeq(Treg_ERT_all_DESeq) -> Treg_ERT_all_dds
+
+counts(Treg_ERT_all_dds, normalized = T) %>%
+  as_tibble(rownames = "Gene") -> norm_counts_all_ert
+
+sF_all_ert <- sizeFactors(Treg_ERT_all_dds)
+
+ertZfp36_loxP_counts %>%
+  select(Probe, 13:48) %>% 
+  rename(Gene = Probe) -> ertZfp36_loxP_counts
+
+for(c in 2:ncol(ertZfp36_loxP_counts)) {
+  ertZfp36_loxP_counts[,c] <- ertZfp36_loxP_counts[,c]/sF_all_ert[c-1]
+}
+
+```
+
+```{r fig.height=3, fig.width=7}
+ertZfp36_loxP_counts %>%
+  pivot_longer(-1, names_to = "Dataset", values_to = "norm_counts") %>%
+  separate(Dataset, c("Replicate", "Population")) %>%
+  mutate(Population = factor(Population, levels = c("A", "B", "C","D"), labels = c("Treg_naive", "Treg_eff", "exTreg_naive", "exTreg_eff"))) %>%
+  mutate(Genotype = factor(grepl("WT", Replicate), levels = c(T,F), labels = c("Ctrl", "KO"))) %>%
+  mutate(Replicate = factor(Replicate, levels = unique(Replicate))) %>%
+  ggplot(aes(x = Replicate, y = norm_counts, colour = Gene, shape = Genotype)) +
+    geom_point() +
+    facet_grid(~Population) +
+    scale_y_log10() +
+      theme_bw() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust=1, size = 6)) +
+      labs(x = NULL, y = "Normalised read counts\nover loxP-flanked region") +
+      scale_colour_brewer(palette = "Dark2")  +
+      scale_shape_manual(values = c(16,2))
+      
+```
+
+Floxed region of Zfp36 is expressed in all (as expected as this is not floxed in these mice) - if anything it looks a bit higher in the KOs. 
+
+Zfp36l1 and l2 look efficiently knocked for all populations. 
+
+
+Exported norm counts for plotting in GraphPad (plots below are equivalent to GraphPad plots that were used in manuscript)
+
+
+```{r}
+ertZfp36_loxP_counts %>%
+  mutate(Gene = paste0(Gene, "_loxP")) %>%
+  bind_rows(norm_counts_all_ert) -> norm_counts_all_ert
+
+
+norm_counts_all_ert %>% write_tsv("creERT2_norm_counts_all.txt")
+```
+
+
+```{r}
+plot_norm_counts_ert <- function(gene) {
+  norm_counts_all_ert %>%
+    filter(Gene == gene) %>%
+    pivot_longer(-Gene, names_to = "Sample", values_to = "norm_counts") %>%
+    mutate(Genotype = factor(grepl("WT", Sample), levels = c(T,F), labels = c("Ctrl", "KO"))) %>%
+    mutate(Celltype = factor(sub("^[A-Z]+[0-9]_", "", Sample), levels = c("A","B", "C","D"), labels = c("Treg_naive", "Treg_effector", "exTreg_naive", "exTreg_effector"))) %>%
+    mutate(mouse = sub("_.*", "", Sample)) %>%
+    left_join(coldata_ert %>% as_tibble(rownames = "mouse") %>% select(-Genotype)) %>%
+    ggplot(aes(x = Celltype, y= norm_counts, fill = Genotype)) +
+      stat_summary(geom = "bar", fun = mean, position = "dodge", colour = "#195e28") +
+      geom_point(position = position_jitterdodge(), aes(group = Genotype, shape = Genotype), colour = "#195e28") +
+      scale_fill_manual(values = c("#a9ccb1", "white")) +
+      scale_shape_manual(values = c(16,1)) +
+      labs(x = NULL, y = "Normalised read counts", title = gene) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+```
+
+
+### Figure S21a-b - normalised counts over loxP-flanked regions
+
+```{r fig.height = 2.7, fig.width=4.5}
+plot_norm_counts_ert("Zfp36l1_loxP")
+plot_norm_counts_ert("Zfp36l2_loxP")
+```
+
+
+### Figure 9c-d - normalised counts over Ifng and Tnf
+
+```{r fig.height = 2.7, fig.width=4.5}
+plot_norm_counts_ert("Ifng")
+plot_norm_counts_ert("Tnf")
+```
+
+
+
+# Control nTreg vs eTreg
+
+
+For single cell analysis, want gene signatures of naive vs effector Tregs. 
+
+Derive these from floxed control mice: in this case all mice are male. 
+
+```{r}
+read.delim("nTreg_eTreg_floxCtrl_raw_counts_Seqmonk.txt") %>%
+  RNA_seqmonk_to_corrected_counts(silent = T, XYexclude = "none", Zfp36exclude = c("Zfp36l1", "Zfp36l2")) -> nTreg_eTreg_Ctrl_raw_counts
+```
+
+```{r}
+nTreg_eTreg_Ctrl_coldata <- data.frame(row.names = colnames(nTreg_eTreg_Ctrl_raw_counts), Celltype = factor(grepl("^nTreg", colnames(nTreg_eTreg_Ctrl_raw_counts)), levels = c(T,F), labels = c("nTreg", "eTreg")))
+
+nTreg_eTreg_Ctrl_raw_counts %>%
+  DESeqDataSetFromMatrix(nTreg_eTreg_Ctrl_coldata, ~Genotype) %>%
+  DESeq() -> nTreg_eTreg_Ctrl_dds
+
+lfcShrink(nTreg_eTreg_Ctrl_dds, coef = 2, type = "normal") %>%
+  as_tibble(rownames = "Gene") ->
+    res_nTreg_eTreg_Ctrl
+```
+
+
+```{r}
+summary(res_nTreg_eTreg_Ctrl)
+
+quantile(res_nTreg_eTreg_Ctrl$log2FoldChange, seq(0.1,0.9, by = 0.1), na.rm = T)
+
+```
+
+
+### Table S6 - eTreg/nTreg markers
+
+Since there is unequal distribution (more with high +ve L2FC than high -ve L2FC), setting different thresholds for these
+
+```{r}
+res_nTreg_eTreg_Ctrl %>%
+  filter(padj < 0.0001 & log2FoldChange > 2) %>%
+  select(Gene) %>% # 375 genes
+  deframe() %>%
+  write("eTreg_marker_genes.txt")
+
+res_nTreg_eTreg_Ctrl %>%
+  filter(padj < 0.0001 & log2FoldChange < -1.5) %>%
+  select(Gene) %>% # 105 genes
+  deframe() %>%
+  write("nTreg_marker_genes.txt")
+
+```
+
